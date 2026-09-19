@@ -1,0 +1,540 @@
+import gc
+import os
+import re
+import io
+import subprocess
+import sys
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import pandas as pd
+import streamlit as st
+
+# SN 對應 Source 與 Slot 的預設對照表
+SN_MAPPING = {
+    "P94186266000E0A2": {"Source": "2nd", "Slot": 8},
+    "P9418626600080A2": {"Source": "2nd", "Slot": 9},
+    "P94186266000G0A2": {"Source": "2nd", "Slot": 10},
+    "P9418626200070A2": {"Source": "2nd", "Slot": 11},
+    "P9418626200060A2": {"Source": "2nd", "Slot": 12},
+    "P94186266000B0A2": {"Source": "2nd", "Slot": 13},
+    "P9418626600070A2": {"Source": "2nd", "Slot": 14},
+    "P94186266000C0A2": {"Source": "2nd", "Slot": 15},
+    "P9418626600090A2": {"Source": "2nd", "Slot": 27},
+    "P9418626500060A2": {"Source": "Main", "Slot": 28},
+    "P9418626500030A2": {"Source": "Main", "Slot": 29},
+    "P9418626200040A2": {"Source": "Main", "Slot": 30},
+    "P9418626500080A2": {"Source": "Main", "Slot": 31},
+    "P9418626500070A2": {"Source": "Main", "Slot": 32},
+    "P9418626500010A2": {"Source": "Main", "Slot": 33},
+    "P9418626200020A2": {"Source": "Main", "Slot": 34},  # 修正：P3774626200020A2 -> P9418626200020A2
+    "P9418626500090A2": {"Source": "Main", "Slot": 35},
+    "P3774626400080A2": {"Source": "Main", "Slot": 36},
+}
+
+
+def clean_stem(filename):
+    """取得標準檔名主體，消除字尾與副檔名差異"""
+    name = os.path.splitext(filename)[0]
+    name = re.sub(r"^nvqual_(report_)?", "", name, flags=re.IGNORECASE)
+    return name.strip()
+
+
+def extract_date_from_filename(filename):
+    """從檔名擷取 YYYY/MM/DD 日期格式"""
+    match = re.search(r"(\d{4})(\d{2})(\d{2})", filename)
+    if match:
+        return f"{match.group(1)}/{match.group(2)}/{match.group(3)}"
+    return "Unknown Date"
+
+
+def parse_excel_fast(file_input):
+    """高效讀取 Excel I15 儲存格"""
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(file_input, data_only=True, read_only=True)
+        sheet_names = wb.sheetnames
+        sheet = wb[sheet_names[0]]
+
+        d15_val = str(sheet.cell(row=15, column=4).value or "").strip()
+        i15_val = str(sheet.cell(row=15, column=9).value or "").strip()
+
+        excel_status = "FAIL" if "FAIL" in d15_val.upper() else "PASS"
+        fname = getattr(file_input, "name", os.path.basename(str(file_input)))
+
+        final_reason = "N/A"
+        if excel_status == "FAIL" and i15_val and i15_val.upper() not in ["NONE", "N/A"]:
+            final_reason = i15_val
+
+        return {
+            "Status": excel_status,
+            "Fail Reason": final_reason,
+            "Excel_Filename": fname,
+        }
+    except Exception as e:
+        fname = getattr(file_input, "name", os.path.basename(str(file_input)))
+        return {
+            "Status": "ERROR",
+            "Fail Reason": f"Excel 解析失敗: {str(e)}",
+            "Excel_Filename": fname,
+        }
+    finally:
+        if wb:
+            wb.close()
+        gc.collect()
+
+
+def parse_large_log_stream(file_input):
+    """解析 Log 檔，精準擷取 Fail 訊息"""
+    serial_number = "Unknown"
+    version = "v1.8"
+    status = "PASS"
+    fail_notes = []
+    has_fail = False
+
+    is_uploaded = hasattr(file_input, "read")
+    fname = file_input.name if is_uploaded else os.path.basename(file_input)
+
+    try:
+        if is_uploaded:
+            content_bytes = file_input.read()
+            lines = content_bytes.decode("utf-8", errors="ignore").splitlines()
+        else:
+            with open(file_input, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+
+        head_text = "\n".join(lines[:200])
+
+        sn_direct_match = re.search(r"\b(P[0-9A-Z]{15})\b", head_text)
+        if sn_direct_match:
+            serial_number = sn_direct_match.group(1)
+        else:
+            sn_match = re.search(r"Serial\s*Number\s*[:=]?\s*([A-Za-z0-9_-]+)", head_text, re.IGNORECASE)
+            if sn_match:
+                serial_number = sn_match.group(1)
+
+        full_text = "\n".join(lines)
+
+        if "FAIL" in head_text.upper() or "did not complete" in full_text or "An Exception occurred" in full_text:
+            has_fail = True
+
+            timeout_match = re.search(r"(SSD subtest did not complete within \d+ sec timeout)", full_text)
+            if timeout_match:
+                fail_notes.append(timeout_match.group(1).strip())
+
+            thermal_match = re.search(r"(An Exception occurred in thermal ssd test[^\n]*)", full_text)
+            if thermal_match:
+                fail_notes.append(thermal_match.group(1).strip())
+
+            io_error_match = re.search(r"(IO Errors found during SSD test on device[^\n]*)", full_text)
+            if io_error_match:
+                fail_notes.append(io_error_match.group(1).strip())
+            else:
+                general_exc_match = re.search(r"(An Exception occurred\.\s*See Exception\.log[^\n]*)", full_text, re.IGNORECASE)
+                if general_exc_match:
+                    fail_notes.append(general_exc_match.group(1).strip())
+
+            if not fail_notes:
+                for line in lines:
+                    line_clean = line.strip()
+                    if "An Exception occurred" in line_clean or "SSD subtest did not complete" in line_clean:
+                        fail_notes.append(line_clean)
+
+    except Exception as e:
+        has_fail = True
+        fail_notes.append(f"Log 讀取例外: {str(e)}")
+
+    sn_info = SN_MAPPING.get(serial_number, {"Source": "Unknown", "Slot": 999})
+
+    if has_fail:
+        status = "FAIL"
+        unique_notes = list(dict.fromkeys(fail_notes))
+        fail_reason_str = "\n".join(unique_notes) if unique_notes else "Unspecified FAIL"
+    else:
+        status = "PASS"
+        fail_reason_str = "N/A"
+
+    return {
+        "NVQUAL Version": version,
+        "Source": sn_info["Source"],
+        "Slot": sn_info["Slot"],
+        "Serial Number": serial_number,
+        "Log_Status": status,
+        "Log_Fail_Reason": fail_reason_str,
+        "Log_Filename": fname,
+    }
+
+
+def generate_multi_loop_excel(df_matrix):
+    """產出每一圈結果獨立分成不同欄/列的 Excel 報表"""
+    output = io.BytesIO()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Multi-Loop Matrix"
+
+    thin_border = Border(
+        left=Side(style='thin', color='D3D3D3'),
+        right=Side(style='thin', color='D3D3D3'),
+        top=Side(style='thin', color='D3D3D3'),
+        bottom=Side(style='thin', color='D3D3D3')
+    )
+
+    header_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    pass_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    fail_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+
+    font_bold = Font(name="Calibri", size=11, bold=True)
+    font_regular = Font(name="Calibri", size=10)
+
+    ws.append([str(c[0]) for c in df_matrix.columns])
+    ws.append([str(c[1]) for c in df_matrix.columns])
+    ws.append([str(c[2]) for c in df_matrix.columns])
+
+    for row in df_matrix.itertuples(index=False):
+        ws.append(list(row))
+
+    for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column), start=1):
+        for c_idx, cell in enumerate(row, start=1):
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+            if r_idx <= 3:
+                cell.fill = header_fill
+                cell.font = font_bold
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif c_idx in [1, 2]:
+                cell.font = font_bold
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.font = font_regular
+                val = str(cell.value or "")
+                if val == "PASS":
+                    cell.fill = pass_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif val != "" and val != "N/A":
+                    cell.fill = fail_fill
+
+    for col in ws.columns:
+        max_len = max(len(str(cell.value or '')) for cell in col)
+        col_letter = get_column_letter(col[0].column)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 14), 45)
+
+    wb.save(output)
+    return output.getvalue()
+
+
+def main():
+    st.set_page_config(
+        page_title="NVQUAL Log 分析工具 / NVQUAL Log Analyzer",
+        layout="wide",
+    )
+
+    st.markdown(
+        """
+        <style>
+        .stApp { background-color: #121212 !important; color: #E0E0E0 !important; }
+        [data-testid="stSidebar"] { background-color: #1E1E1E !important; border-right: 1px solid #76B900 !important; }
+        .main-title { font-size: 2.2rem !important; font-weight: bold !important; color: #76B900 !important; margin-bottom: 1rem !important; }
+        [data-testid="stDataFrame"] { background-color: #1E1E1E !important; border: 1px solid #76B900 !important; }
+        [data-testid="stDataFrame"] * { font-size: 1.25rem !important; white-space: pre-wrap !important; }
+        p, span, label, .stSelectbox label, .stMultiSelect label, .stTextInput label { font-size: 1.6rem !important; color: #FFFFFF !important; font-weight: bold !important; }
+        div[data-baseweb="select"] > div, input { background-color: #2D2D2D !important; color: #FFFFFF !important; font-size: 1.4rem !important; border: 1px solid #76B900 !important; }
+        [data-testid="stMetricValue"] { font-size: 3rem !important; color: #76B900 !important; font-weight: bold !important; }
+        [data-testid="stMetricLabel"] { font-size: 1.6rem !important; color: #AAAAAA !important; }
+        .stButton>button, .stDownloadButton>button { background-color: #76B900 !important; color: #000000 !important; font-size: 1.5rem !important; font-weight: bold !important; }
+
+        /* 🚫 強制隱藏表格右上角 Toolbar */
+        [data-testid="stDataFrameToolbar"],
+        [data-testid="stElementToolbar"],
+        div[data-testid="stDataFrame"] button {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0px !important;
+            opacity: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="main-title">📊 NVQUAL Log 批次與補上傳綜合分析工具</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_input1, col_input2 = st.columns([1, 1])
+
+    with col_input1:
+        raw_path = st.text_input("方法一：輸入本地資料夾完整路徑", placeholder="例如: C:\\Users\\User\\Desktop\\LogFolder")
+        folder_path = raw_path.strip().strip('"').strip("'")
+
+    with col_input2:
+        uploaded_files = st.file_uploader(
+            "方法二：手動選擇/補上傳單獨檔案 (.log, .xlsx)",
+            type=["log", "txt", "xlsx"],
+            accept_multiple_files=True,
+        )
+
+    excel_map = {}
+    log_files = []
+
+    if folder_path:
+        if os.path.exists(folder_path):
+            with st.spinner("⏳ 正在分析資料夾中的檔案，請稍候..."):
+                for root, _, files in os.walk(folder_path):
+                    for f in files:
+                        file_path = os.path.join(root, f)
+                        fname = os.path.basename(file_path)
+
+                        if fname.lower().endswith(".xlsx") and not fname.startswith("~$"):
+                            stem_key = clean_stem(fname)
+                            excel_map[stem_key] = parse_excel_fast(file_path)
+                        elif fname.lower().endswith((".log", ".txt")):
+                            log_files.append(parse_large_log_stream(file_path))
+        else:
+            st.error(f"❌ 找不到該資料夾路徑，請確認路徑是否正確：`{folder_path}`")
+
+    if uploaded_files:
+        with st.spinner("⏳ 正在處理上傳的檔案..."):
+            for file_obj in uploaded_files:
+                fname = file_obj.name
+                if fname.lower().endswith(".xlsx") and not fname.startswith("~$"):
+                    stem_key = clean_stem(fname)
+                    excel_map[stem_key] = parse_excel_fast(file_obj)
+                elif fname.lower().endswith((".log", ".txt")):
+                    log_files.append(parse_large_log_stream(file_obj))
+
+    if log_files:
+        data_list = []
+        for log in log_files:
+            log_fname = log["Log_Filename"]
+            log_stem = clean_stem(log_fname)
+            test_date = extract_date_from_filename(log_fname)
+
+            excel_data = excel_map.get(log_stem, None)
+
+            if (excel_data and excel_data["Status"] == "FAIL") or log["Log_Status"] == "FAIL":
+                status = "FAIL"
+                if excel_data and excel_data["Fail Reason"] != "N/A":
+                    fail_reason = excel_data["Fail Reason"]
+                else:
+                    fail_reason = log["Log_Fail_Reason"]
+            else:
+                status = "PASS"
+                fail_reason = "PASS"
+
+            data_list.append(
+                {
+                    "Date": test_date,
+                    "Filename": log["Log_Filename"],
+                    "NVQUAL Version": log["NVQUAL Version"],
+                    "Source": log["Source"],
+                    "Slot": int(log["Slot"]) if str(log["Slot"]).isdigit() else 999,
+                    "Serial Number": log["Serial Number"],
+                    "Status": status,
+                    "Fail Reason": fail_reason,
+                }
+            )
+
+        df = pd.DataFrame(data_list)
+        df = df.sort_values(by=["Slot", "Filename"], ascending=[True, True]).reset_index(drop=True)
+
+        st.sidebar.markdown("### 🔍 條件篩選面板 / Filter Panel", unsafe_allow_html=True)
+
+        status_options = ["All"] + list(df["Status"].unique())
+        selected_status = st.sidebar.selectbox("篩選 Status / Filter Status", status_options)
+
+        source_options = ["All"] + list(df["Source"].unique())
+        selected_source = st.sidebar.selectbox("篩選 Source / Filter Source", source_options)
+
+        slot_options = sorted([s for s in df["Slot"].unique() if s != 999])
+        selected_slots = st.sidebar.multiselect(
+            "篩選 Slot / Filter Slot (可多選)",
+            options=slot_options,
+            placeholder="選擇一或多個 Slot...",
+        )
+
+        sn_options = ["All"] + sorted([sn for sn in df["Serial Number"].unique() if sn != "Unknown"])
+        selected_sn = st.sidebar.selectbox("篩選 Serial Number / Filter SN", sn_options)
+
+        version_options = ["All"] + list(df["NVQUAL Version"].unique())
+        selected_version = st.sidebar.selectbox("篩選 NVQUAL Version / Filter Version", version_options)
+
+        fail_combinations = df[df["Status"] == "FAIL"]["Fail Reason"].unique().tolist()
+        fail_combo_options = ["All Fail Combinations"] + fail_combinations
+        selected_combo = st.sidebar.selectbox("篩選 Fail 原因組合 / Filter Fail Pattern", fail_combo_options)
+
+        search_keyword = st.sidebar.text_input("關鍵字搜尋 / Keyword Search", "")
+
+        filtered_df = df.copy()
+
+        if selected_status != "All":
+            filtered_df = filtered_df[filtered_df["Status"] == selected_status]
+
+        if selected_source != "All":
+            filtered_df = filtered_df[filtered_df["Source"] == selected_source]
+
+        if selected_slots:
+            filtered_df = filtered_df[filtered_df["Slot"].isin(selected_slots)]
+
+        if selected_sn != "All":
+            filtered_df = filtered_df[filtered_df["Serial Number"] == selected_sn]
+
+        if selected_version != "All":
+            filtered_df = filtered_df[filtered_df["NVQUAL Version"] == selected_version]
+
+        if selected_combo != "All Fail Combinations":
+            filtered_df = filtered_df[filtered_df["Fail Reason"] == selected_combo]
+
+        if search_keyword:
+            filtered_df = filtered_df[
+                filtered_df["Serial Number"].str.contains(search_keyword, case=False, na=False)
+                | filtered_df["Slot"].astype(str).str.contains(search_keyword, case=False, na=False)
+                | filtered_df["Fail Reason"].str.contains(search_keyword, case=False, na=False)
+                | filtered_df["Filename"].str.contains(search_keyword, case=False, na=False)
+            ]
+
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns(4)
+
+        total_count = len(df)
+        pass_df = df[df["Status"] == "PASS"]
+        fail_df = df[df["Status"] == "FAIL"]
+        versions = df["NVQUAL Version"].unique()
+
+        col1.metric("總讀取數 / Total", total_count)
+        col2.metric("PASS 筆數 / Pass", len(pass_df))
+        col3.metric("FAIL 筆數 / Fail", len(fail_df))
+        col4.metric("NVQUAL 版本 / Version", ", ".join(versions))
+
+        # --- 1. 直式明細列表 ---
+        st.markdown(
+            f"### 📋 分析明細列表 (直式) / Detail List (共 {len(filtered_df)} 筆符合)",
+            unsafe_allow_html=True,
+        )
+
+        st.dataframe(
+            filtered_df.drop(columns=["Date"]),
+            column_config={
+                "Filename": st.column_config.TextColumn("Filename / 檔名", width="medium"),
+                "NVQUAL Version": st.column_config.TextColumn("Version / 版本", width="small"),
+                "Source": st.column_config.TextColumn("Source / 來源", width="small"),
+                "Slot": st.column_config.NumberColumn("Slot / 插槽", format="%d", width="small"),
+                "Serial Number": st.column_config.TextColumn("Serial Number / 序號", width="medium"),
+                "Status": st.column_config.TextColumn("Status / 狀態", width="small"),
+                "Fail Reason": st.column_config.TextColumn("Fail Reason / 失敗原因組合", width="large"),
+            },
+            width="stretch",
+            hide_index=True,
+        )
+
+        # --- 2. 橫向矩陣視圖 (Slot 依數值從小到大排序) ---
+        st.markdown("---")
+        st.markdown("### ↔️ 每圈獨立列 + 4 欄獨立標頭 Slot 橫向矩陣")
+        st.caption("💡 Slot 依數值小到大排列（Slot 8 ➜ Slot 9 ➜ Slot 10...）；每一圈（Pass/Loop）各自佔據獨立一列。")
+
+        filtered_df_sorted = filtered_df.sort_values(by=["Date", "Slot", "Filename"]).copy()
+        filtered_df_sorted["Loop"] = filtered_df_sorted.groupby(["Date", "Slot"]).cumcount() + 1
+        filtered_df_sorted["Loop_Label"] = filtered_df_sorted["Loop"].apply(lambda x: f"Pass {x}")
+
+        matrix_rows = []
+        for _, row in filtered_df_sorted.iterrows():
+            content = "PASS" if row["Status"] == "PASS" else row["Fail Reason"]
+            matrix_rows.append({
+                "Date": row["Date"],
+                "Loop": row["Loop_Label"],
+                "Source": row["Source"],
+                "Slot_Num": int(row["Slot"]),
+                "Slot_Label": f"Slot {row['Slot']}",
+                "Serial Number": row["Serial Number"],
+                "Content": content
+            })
+
+        if matrix_rows:
+            m_df = pd.DataFrame(matrix_rows)
+
+            pivot_df = m_df.pivot_table(
+                index=["Date", "Loop"],
+                columns=["Source", "Slot_Num", "Slot_Label", "Serial Number"],
+                values="Content",
+                aggfunc="first"
+            ).fillna("")
+
+            # 依 Slot 數值嚴格排序 (8 -> 9 -> 10...)
+            sorted_cols = sorted(pivot_df.columns, key=lambda x: (x[0], x[1], x[2], x[3]))
+            pivot_df = pivot_df[sorted_cols]
+
+            # 產生 Excel 匯出用 DataFrame (移除排序用中間欄位 Slot_Num)
+            excel_cols = [(col[0], col[2], col[3]) for col in pivot_df.columns]
+            export_df = pivot_df.copy()
+            export_df.columns = pd.MultiIndex.fromTuples(excel_cols) if hasattr(pd.MultiIndex, 'fromTuples') else pd.MultiIndex.from_tuples(excel_cols)
+            export_df = export_df.reset_index()
+
+            # 前端展視呈現用 DataFrame
+            st.dataframe(export_df, width="stretch")
+
+            # 下載 Excel
+            excel_bytes = generate_multi_loop_excel(export_df)
+            st.download_button(
+                label="📥 下載多圈獨立橫向矩陣 Excel 報表 (.xlsx)",
+                data=excel_bytes,
+                file_name="nvqual_multi_loop_matrix.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        # --- 3. Fail 原因統計與專屬 CSV 下載 ---
+        st.markdown("---")
+        st.markdown("### ⚠️ Fail 原因組合統計 / Fail Patterns Summary")
+
+        fail_summary_df = filtered_df[filtered_df["Status"] == "FAIL"]
+
+        if not fail_summary_df.empty:
+            summary = fail_summary_df["Fail Reason"].value_counts().reset_index()
+            summary.columns = ["Fail Reason / 失敗原因組合", "數量 / Count"]
+
+            total_fails = len(fail_summary_df)
+            summary["佔總 Fail 比例 / Percentage"] = summary["數量 / Count"].apply(
+                lambda x: f"{(x / total_fails) * 100:.1f}%"
+            )
+
+            st.dataframe(
+                summary,
+                column_config={
+                    "Fail Reason / 失敗原因組合": st.column_config.TextColumn("Fail Reason / 失敗原因組合", width="large"),
+                    "數量 / Count": st.column_config.NumberColumn("數量 / Count", format="%d", width="small"),
+                    "佔總 Fail 比例 / Percentage": st.column_config.TextColumn("佔總 Fail 比例 / Percentage", width="small"),
+                },
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.markdown("---")
+            fail_summary_csv = summary.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="📥 下載 Fail 原因組合統計 CSV / Download Fail Patterns CSV",
+                data=fail_summary_csv,
+                file_name="fail_patterns_summary.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("🎉 目前篩選條件下沒有任何 FAIL 紀錄！ / No FAIL records found under current filters.")
+
+    elif folder_path and os.path.exists(folder_path):
+        st.warning("⚠️ 該資料夾中沒有找到任何 `.log`, `.txt` 或 `.xlsx` 檔案，請檢查資料夾內容！")
+    else:
+        st.info("請輸入資料夾路徑或拖曳/點擊選擇單獨檔案進行解析。")
+
+
+if __name__ == "__main__":
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        is_running_in_streamlit = get_script_run_ctx() is not None
+    except Exception:
+        is_running_in_streamlit = False
+
+    if is_running_in_streamlit:
+        main()
+    else:
+        script_path = os.path.abspath(__file__)
+        subprocess.run([sys.executable, "-m", "streamlit", "run", script_path])
