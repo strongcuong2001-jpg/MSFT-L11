@@ -1,1 +1,70 @@
+import hashlib
+import shutil
+from pathlib import Path
 
+
+def get_file_hash(file_path):
+    """計算檔案的 MD5 雜湊值（比對檔案內容是否完全一致）"""
+    hasher = hashlib.md5()
+    with open(file_path, "rb") as f:
+        # 分批讀取大檔案（避免記憶體不足）
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+# 1. 設定來源與目標資料夾路徑
+source_dir = Path(
+    r"C:\Users\USER04\Desktop\Fii project\C9A16 raw data\L11\NVQUAL\NVQUAL 已解壓縮\0918\14.20260917_1103_Chamber4040_Coolant45C320_AC_Stress_7cycles_After2ndSourcereworkedITPSB\14.20260917_1103_Chamber4040_Coolant45C320_AC_Stress_7cycles_After2ndSourcereworkedITPSB"
+)
+target_dir = Path(r"C:\Users\USER04\Desktop\Fii project\C9A16 raw data\L11\NVQUAL\NVQUAL 已解壓縮\0918\14.20260917_1103_Chamber4040_Coolant45C320_AC_Stress_7cycles_After2ndSourcereworkedITPSB\target")
+
+target_dir.mkdir(parents=True, exist_ok=True)
+
+# 2. 搜尋符合條件的檔案
+excel_extensions = {".xlsx", ".xls", ".xlsm", ".csv"}
+matching_files = []
+
+for f in source_dir.rglob("*"):
+    if not f.is_file():
+        continue
+    ext = f.suffix.lower()
+    name_lower = f.name.lower()
+
+    if (ext in excel_extensions or ext == ".log") and name_lower.startswith(
+        "nvqual"
+    ):
+        matching_files.append(f)
+
+print(
+    f"共找到 {len(matching_files)} 個符合格式的檔案，開始進行『內容去重』複製...\n"
+)
+
+copied_hashes = set()  # 用來記錄已複製過的檔案內容
+copied_count = 0
+skipped_duplicate_content = 0
+
+for file in matching_files:
+    file_hash = get_file_hash(file)
+
+    # 內容完全一樣直接跳過
+    if file_hash in copied_hashes:
+        print(f"【跳過】內容完全重複的檔案：{file.name}")
+        skipped_duplicate_content += 1
+        continue
+
+    # 處理檔名剛好相同但內容不同的情況
+    destination = target_dir / file.name
+    counter = 1
+    while destination.exists():
+        destination = target_dir / f"{file.stem}_({counter}){file.suffix}"
+        counter += 1
+
+    shutil.copy2(file, destination)
+    copied_hashes.add(file_hash)
+    print(f"【成功】已複製：{destination.name}")
+    copied_count += 1
+
+print(
+    f"\n處理完成！成功複製 {copied_count} 個獨立檔案，跳過 {skipped_duplicate_content} 個『內容完全重複』的檔案。"
+)
