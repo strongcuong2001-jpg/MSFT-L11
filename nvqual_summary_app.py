@@ -85,7 +85,17 @@ def parse_excel_fast(file_input):
 
 
 def parse_large_log_stream(file_input):
-    """解析 Log 檔，精準擷取 Fail 訊息"""
+    """
+    解析 Log 檔，精準擷取 Fail 訊息。
+
+    註記：有些 log 檔案本身在產出當下就沒有把真正的序號寫進去
+    （例如出現 `Serial Number    Serial` 這種佔位字串，而不是真正的
+    P 開頭序號）。這種情況下，序號本身就無法對應到任何 Slot，
+    屬於「資料本身缺失」而非解析邏輯錯誤，因此這裡仍然照實擷取出
+    當下抓到的字串（即使它是 "Serial" 這種無意義字串），交由後續
+    main() 的邏輯判斷是否能對應到 SN_MAPPING；對應不到的紀錄會被
+    另外獨立列出，不會混入任何 Slot 的圈數計算。
+    """
     serial_number = "Unknown"
     version = "v1.8"
     status = "PASS"
@@ -111,7 +121,12 @@ def parse_large_log_stream(file_input):
         else:
             sn_match = re.search(r"Serial\s*Number\s*[:=]?\s*([A-Za-z0-9_-]+)", head_text, re.IGNORECASE)
             if sn_match:
-                serial_number = sn_match.group(1)
+                candidate = sn_match.group(1).strip()
+                # "Serial" 本身是佔位字串（欄位沒被真正填值），視同讀不到序號，
+                # 不要把它當作一個「看似合法」的序號帶下去，以免誤判成某個
+                # 從未出現過的 SN 而悄悄產生錯誤對應。
+                if candidate and candidate.upper() != "SERIAL":
+                    serial_number = candidate
 
         full_text = "\n".join(lines)
 
@@ -165,6 +180,26 @@ def parse_large_log_stream(file_input):
     }
 
 
+# 已知的標準 Fail 訊息樣式，符合這些樣式的 Fail cell 維持原本淡紅色；
+# 內容含有非這些樣式的文字（例如 MODS/GPU 相關的其他錯誤），則改為亮黃色標示。
+KNOWN_FAIL_PATTERNS = [
+    re.compile(r"SSD subtest did not complete within \d+ sec timeout"),
+    re.compile(r"An Exception occurred in thermal ssd test\.\s*See ssd_exception\.log"),
+    re.compile(r"IO Errors found during SSD test on device"),
+    re.compile(r"An Exception occurred\.\s*See Exception\.log"),
+]
+
+
+def _is_known_fail_line(line):
+    return any(p.search(line) for p in KNOWN_FAIL_PATTERNS)
+
+
+def _is_known_fail_content(val):
+    """判斷整個 cell 內容是否『每一行』都符合已知的標準 Fail 訊息樣式"""
+    lines = [line for line in val.split("\n") if line.strip()]
+    return bool(lines) and all(_is_known_fail_line(line) for line in lines)
+
+
 def generate_multi_loop_excel(df_matrix):
     """產出每一圈結果獨立分成不同欄/列的 Excel 報表"""
     output = io.BytesIO()
@@ -173,15 +208,16 @@ def generate_multi_loop_excel(df_matrix):
     ws.title = "Multi-Loop Matrix"
 
     thin_border = Border(
-        left=Side(style='thin', color='D3D3D3'),
-        right=Side(style='thin', color='D3D3D3'),
-        top=Side(style='thin', color='D3D3D3'),
-        bottom=Side(style='thin', color='D3D3D3')
+        left=Side(style="thin", color="D3D3D3"),
+        right=Side(style="thin", color="D3D3D3"),
+        top=Side(style="thin", color="D3D3D3"),
+        bottom=Side(style="thin", color="D3D3D3"),
     )
 
     header_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
     pass_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
     fail_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    other_fail_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
     font_bold = Font(name="Calibri", size=11, bold=True)
     font_regular = Font(name="Calibri", size=10)
@@ -212,10 +248,13 @@ def generate_multi_loop_excel(df_matrix):
                     cell.fill = pass_fill
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                 elif val != "" and val != "N/A":
-                    cell.fill = fail_fill
+                    if _is_known_fail_content(val):
+                        cell.fill = fail_fill
+                    else:
+                        cell.fill = other_fail_fill
 
     for col in ws.columns:
-        max_len = max(len(str(cell.value or '')) for cell in col)
+        max_len = max(len(str(cell.value or "")) for cell in col)
         col_letter = get_column_letter(col[0].column)
         ws.column_dimensions[col_letter].width = min(max(max_len + 3, 14), 45)
 
@@ -431,56 +470,99 @@ def main():
         # --- 2. 橫向矩陣視圖 (Slot 依數值從小到大排序) ---
         st.markdown("---")
         st.markdown("### ↔️ 每圈獨立列 + 4 欄獨立標頭 Slot 橫向矩陣")
-        st.caption("💡 Slot 依數值小到大排列（Slot 8 ➜ Slot 9 ➜ Slot 10...）；每一圈（Pass/Loop）各自佔據獨立一列。")
+        st.caption(
+            "💡 Slot 依數值小到大排列（Slot 8 ➜ Slot 9 ➜ Slot 10...）；每一圈（Pass/Loop）各自佔據獨立一列。\n"
+            "⚠️ **序號讀不到（無法對應到任何 Slot）的紀錄，不會計入下方矩陣的任何一圈**，"
+            "也不會被下一筆有效資料自動遞補上來，而是完整列在右側「無法辨識序號」清單中。"
+        )
 
-        filtered_df_sorted = filtered_df.sort_values(by=["Date", "Slot", "Filename"]).copy()
-        filtered_df_sorted["Loop"] = filtered_df_sorted.groupby(["Date", "Slot"]).cumcount() + 1
-        filtered_df_sorted["Loop_Label"] = filtered_df_sorted["Loop"].apply(lambda x: f"Pass {x}")
+        # === 核心修正 ===
+        # 把「序號能正確對應到 Slot」跟「序號讀不到 / 對不到 SN_MAPPING」的紀錄分開：
+        #   - matrix_source_df：只有這些才會進入下方的 Slot 橫向矩陣、參與圈數計算。
+        #   - unresolved_df：序號讀不到的紀錄，完全不進入矩陣，不占用、也不影響
+        #     任何 Slot 的圈數編號，另外用右側獨立表格列出。
+        matrix_source_df = filtered_df[
+            (filtered_df["Source"] != "Unknown") & (filtered_df["Slot"] != 999)
+        ].copy()
+        unresolved_df = filtered_df[
+            (filtered_df["Source"] == "Unknown") | (filtered_df["Slot"] == 999)
+        ].copy()
 
-        matrix_rows = []
-        for _, row in filtered_df_sorted.iterrows():
-            content = "PASS" if row["Status"] == "PASS" else row["Fail Reason"]
-            matrix_rows.append({
-                "Date": row["Date"],
-                "Loop": row["Loop_Label"],
-                "Source": row["Source"],
-                "Slot_Num": int(row["Slot"]),
-                "Slot_Label": f"Slot {row['Slot']}",
-                "Serial Number": row["Serial Number"],
-                "Content": content
-            })
+        col_matrix, col_unresolved = st.columns([3, 1])
 
-        if matrix_rows:
-            m_df = pd.DataFrame(matrix_rows)
+        with col_matrix:
+            filtered_df_sorted = matrix_source_df.sort_values(by=["Date", "Slot", "Filename"]).copy()
+            filtered_df_sorted["Loop"] = filtered_df_sorted.groupby(["Date", "Slot"]).cumcount() + 1
+            filtered_df_sorted["Loop_Label"] = filtered_df_sorted["Loop"].apply(lambda x: f"Pass {x}")
 
-            pivot_df = m_df.pivot_table(
-                index=["Date", "Loop"],
-                columns=["Source", "Slot_Num", "Slot_Label", "Serial Number"],
-                values="Content",
-                aggfunc="first"
-            ).fillna("")
+            matrix_rows = []
+            for _, row in filtered_df_sorted.iterrows():
+                content = "PASS" if row["Status"] == "PASS" else row["Fail Reason"]
+                matrix_rows.append({
+                    "Date": row["Date"],
+                    "Loop": row["Loop_Label"],
+                    "Source": row["Source"],
+                    "Slot_Num": int(row["Slot"]),
+                    "Slot_Label": f"Slot {row['Slot']}",
+                    "Serial Number": row["Serial Number"],
+                    "Content": content,
+                })
 
-            # 依 Slot 數值嚴格排序 (8 -> 9 -> 10...)
-            sorted_cols = sorted(pivot_df.columns, key=lambda x: (x[0], x[1], x[2], x[3]))
-            pivot_df = pivot_df[sorted_cols]
+            if matrix_rows:
+                m_df = pd.DataFrame(matrix_rows)
 
-            # 產生 Excel 匯出用 DataFrame (移除排序用中間欄位 Slot_Num)
-            excel_cols = [(col[0], col[2], col[3]) for col in pivot_df.columns]
-            export_df = pivot_df.copy()
-            export_df.columns = pd.MultiIndex.fromTuples(excel_cols) if hasattr(pd.MultiIndex, 'fromTuples') else pd.MultiIndex.from_tuples(excel_cols)
-            export_df = export_df.reset_index()
+                pivot_df = m_df.pivot_table(
+                    index=["Date", "Loop"],
+                    columns=["Source", "Slot_Num", "Slot_Label", "Serial Number"],
+                    values="Content",
+                    aggfunc="first",
+                ).fillna("")
 
-            # 前端展視呈現用 DataFrame
-            st.dataframe(export_df, width="stretch")
+                # 依 Slot 數值嚴格排序 (8 -> 9 -> 10...)
+                sorted_cols = sorted(pivot_df.columns, key=lambda x: (x[0], x[1], x[2], x[3]))
+                pivot_df = pivot_df[sorted_cols]
 
-            # 下載 Excel
-            excel_bytes = generate_multi_loop_excel(export_df)
-            st.download_button(
-                label="📥 下載多圈獨立橫向矩陣 Excel 報表 (.xlsx)",
-                data=excel_bytes,
-                file_name="nvqual_multi_loop_matrix.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                # 產生 Excel 匯出用 DataFrame (移除排序用中間欄位 Slot_Num)
+                excel_cols = [(col[0], col[2], col[3]) for col in pivot_df.columns]
+                export_df = pivot_df.copy()
+                export_df.columns = pd.MultiIndex.from_tuples(excel_cols)
+                export_df = export_df.reset_index()
+
+                # 前端展視呈現用 DataFrame
+                st.dataframe(export_df, width="stretch")
+
+                # 下載 Excel
+                excel_bytes = generate_multi_loop_excel(export_df)
+                st.download_button(
+                    label="📥 下載多圈獨立橫向矩陣 Excel 報表 (.xlsx)",
+                    data=excel_bytes,
+                    file_name="nvqual_multi_loop_matrix.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            else:
+                st.info("目前篩選條件下，沒有任何能對應到 Slot 的紀錄可以組成矩陣。")
+
+        with col_unresolved:
+            st.markdown("#### ⚠️ 無法辨識序號")
+            st.caption("序號讀不到 / 對不到 SN_MAPPING，未列入左側矩陣圈數")
+            if not unresolved_df.empty:
+                unresolved_display = unresolved_df[["Filename", "Slot", "Source", "Status"]].copy()
+                unresolved_display["Slot"] = "—"  # 無法辨識，故不顯示無意義的 999
+                unresolved_display = unresolved_display.rename(
+                    columns={
+                        "Filename": "檔名",
+                        "Slot": "Slot",
+                        "Source": "Source",
+                        "Status": "Pass/Fail",
+                    }
+                )
+                st.dataframe(
+                    unresolved_display,
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.success("目前沒有序號讀不到的紀錄 👍")
 
         # --- 3. Fail 原因統計與專屬 CSV 下載 ---
         st.markdown("---")
