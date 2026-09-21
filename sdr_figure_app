@@ -1,1 +1,528 @@
+import re
+import os
+import pandas as pd
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+# 設定 Matplotlib 支援中文顯示
+plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 全域變數
+current_df = None
+canvas = None
+
+# 裝置類群組：選這些群組時，該裝置底下所有訊號（不管是溫度/電壓/功率）完整顯示，不做排除
+DEVICE_KEYWORDS = ['E1S', 'CPU', 'GPU']
+
+# 量測類群組：選這些群組時，會先排除掉已經屬於上面「裝置類群組」的訊號，
+# 只留下真正「不屬於任何裝置群組」的其他同類型訊號，避免跟 E1S/CPU/GPU 群組重複顯示
+METRIC_KEYWORDS = ['VOLT', 'TMP', 'PWR', 'CUR', 'FAN', 'SOC']
+
+# 批次資料夾模式：從子資料夾名稱（例如 ...Slot8、Baseline_Test_Slot10）判斷 Slot 編號
+SLOT_PATTERN = re.compile(r'Slot(\d+)', re.IGNORECASE)
+
+
+def parse_sdr_log(file_path):
+    """ 解析 SDR 文字檔並回傳 Pandas DataFrame """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到檔案: {file_path}")
+
+    timestamp_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$')
+    parsed_records = []
+    current_timestamp = None
+
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            if timestamp_pattern.match(line):
+                current_timestamp = line
+                continue
+
+            if '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) == 3:
+                    sensor_name, value_str, status = parts
+                    val_match = re.match(r'^([\d\.]+)\s*(.*)$', value_str)
+                    if val_match:
+                        raw_value = float(val_match.group(1))
+                        unit = val_match.group(2) if val_match.group(2) else None
+                    else:
+                        raw_value = None
+                        unit = None
+
+                    parsed_records.append({
+                        'Timestamp': current_timestamp,
+                        'Sensor_Name': sensor_name,
+                        'Raw_Value': raw_value,
+                        'Unit': unit,
+                        'Status': status,
+                        'Original_Reading': value_str
+                    })
+
+    df = pd.DataFrame(parsed_records)
+    if not df.empty:
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    return df
+
+
+def find_slot_files(root_folder):
+    """
+    遞迴掃描資料夾，依子資料夾名稱中的 Slot 編號（如 ...Slot8）
+    找出各 Slot 對應的 SDR 文字檔（檔名需包含 'sdr'）。
+    回傳 {slot_no: [Path, ...]}，依 slot_no 排序。
+    """
+    root_path = Path(root_folder)
+    slot_files = {}
+
+    for txt_path in root_path.rglob('*.txt'):
+        if 'sdr' not in txt_path.name.lower():
+            continue
+
+        slot_no = None
+        for part in txt_path.relative_to(root_path).parts:
+            m = SLOT_PATTERN.search(part)
+            if m:
+                slot_no = int(m.group(1))
+
+        if slot_no is not None:
+            slot_files.setdefault(slot_no, []).append(txt_path)
+
+    return dict(sorted(slot_files.items()))
+
+
+def parse_sdr_log_multi(slot_files):
+    """ 依 {slot_no: [file_paths]} 解析所有檔案，合併為單一 DataFrame（新增 Slot 欄位） """
+    all_dfs = []
+    errors = []
+
+    for slot_no, paths in slot_files.items():
+        for p in paths:
+            try:
+                df = parse_sdr_log(p)
+                if not df.empty:
+                    df['Slot'] = slot_no
+                    all_dfs.append(df)
+            except Exception as e:
+                errors.append(f"Slot {slot_no} ({p.name}): {e}")
+
+    if not all_dfs:
+        return pd.DataFrame(), errors
+
+    return pd.concat(all_dfs, ignore_index=True), errors
+
+
+def update_sensor_dropdown(df):
+    """ 更新下拉選單 """
+    sensors = sorted(df['Sensor_Name'].unique().tolist())
+    groups = ['[全部顯示]']
+
+    keywords = DEVICE_KEYWORDS + METRIC_KEYWORDS
+    for kw in keywords:
+        if any(kw in s for s in sensors):
+            groups.append(f"[群組] {kw}")
+
+    options = groups + sensors
+    sensor_combobox['values'] = options
+    sensor_combobox.current(0)
+
+
+def filter_by_keyword_group(df_filtered, kw):
+    """
+    依關鍵字群組篩選資料。
+    - 若 kw 屬於「量測類」關鍵字（TMP/VOLT/PWR/CUR/FAN/SOC），
+      會先排除掉已經屬於 E1S/CPU/GPU 這幾個「裝置類」群組的訊號，
+      避免重複顯示（例如 E1S_1_TMP、M0_CPU_TMPAVG0、GPU0_DRAM0_TMP0 這些
+      已經在各自裝置群組看得到，就不需要在 TMP 群組裡再出現一次）。
+    - 若 kw 屬於「裝置類」關鍵字（E1S/CPU/GPU），維持原本行為，
+      該裝置底下所有訊號（不論類型）都完整顯示。
+    """
+    mask = df_filtered['Sensor_Name'].str.contains(kw, case=False, na=False)
+
+    if kw in METRIC_KEYWORDS:
+        for dev_kw in DEVICE_KEYWORDS:
+            mask &= ~df_filtered['Sensor_Name'].str.contains(dev_kw, case=False, na=False)
+
+    return df_filtered[mask]
+
+
+def plot_sdr_data(filter_key="[全部顯示]"):
+    global current_df, canvas
+
+    if current_df is None or current_df.empty:
+        return
+
+    # 清除舊圖表
+    for widget in chart_frame.winfo_children():
+        widget.destroy()
+
+    # 數據篩選（含 Slot 篩選，與統計功能共用邏輯）
+    df_filtered = get_filtered_df(filter_key)
+
+    if df_filtered.empty:
+        messagebox.showwarning("提示", "此篩選條件下無可顯示的數據。")
+        return
+
+    # 依單位繪製子圖
+    units = df_filtered['Unit'].fillna('Other').unique()
+    num_plots = len(units)
+
+    fig, axes = plt.subplots(num_plots, 1, figsize=(11, max(4.0, 3.2 * num_plots)), sharex=True)
+    if num_plots == 1:
+        axes = [axes]
+
+    vlines = []
+    annotations = []
+
+    for ax, unit in zip(axes, units):
+        unit_df = df_filtered[df_filtered['Unit'].fillna('Other') == unit]
+        sensors = unit_df['Sensor_Name'].unique()
+
+        for sensor in sensors:
+            sensor_data = unit_df[unit_df['Sensor_Name'] == sensor]
+            ax.plot(sensor_data['Timestamp'], sensor_data['Raw_Value'], marker='o', label=sensor, markersize=3)
+
+        ax.set_ylabel(f'數值 ({unit})', fontsize=9)
+        ax.grid(True, linestyle='--', alpha=0.5)
+        ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8, borderaxespad=0)
+
+        # 1. 動態垂直紅線
+        vline = ax.axvline(x=df_filtered['Timestamp'].iloc[0], color='red', linestyle='--', alpha=0, linewidth=1.2)
+        vlines.append(vline)
+
+        # 2. 圖表內的多行浮動提示框
+        annot = ax.annotate(
+            "", xy=(0, 0), xytext=(15, 15), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.5", fc="#FFFFCC", ec="black", lw=1, alpha=0.9),
+            fontsize=9, fontfamily="Consolas"
+        )
+        annot.set_visible(False)
+        annotations.append((ax, annot, unit))
+
+    axes[-1].set_xlabel('時間 (Timestamp)', fontsize=10)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    # 滑鼠移動監聽事件：同時列出目前顯示的「每一個 sensor」在該時間點附近的數值
+    # (針對每個 sensor 各自找最近時間點，避免各 sensor 時間戳記沒有完全對齊時漏抓)
+    def on_mouse_move(event):
+        if not event.inaxes or event.xdata is None:
+            for vl in vlines:
+                vl.set_alpha(0)
+            for _, annot, _ in annotations:
+                annot.set_visible(False)
+            canvas.draw_idle()
+            return
+
+        try:
+            # 轉換 X 軸座標為 Pandas 時間格式
+            x_dt = pd.Timestamp(mdates.num2date(event.xdata)).tz_localize(None)
+
+            # 針對畫面上每一個 sensor，各自找出離滑鼠時間最近的一筆資料
+            nearest_rows = []
+            for sensor in df_filtered['Sensor_Name'].unique():
+                sensor_data = df_filtered[df_filtered['Sensor_Name'] == sensor]
+                idx = (sensor_data['Timestamp'] - x_dt).abs().idxmin()
+                nearest_rows.append(sensor_data.loc[idx])
+            snap_df = pd.DataFrame(nearest_rows)
+
+            # 更新垂直指示線（直接跟隨滑鼠 X 座標）
+            x_num = event.xdata
+            for vl in vlines:
+                vl.set_xdata([x_num, x_num])
+                vl.set_alpha(0.8)
+
+            # 針對每個子圖（依 Unit 分）更新提示框，同一單位下所有 sensor 一起列出
+            for ax, annot, unit in annotations:
+                unit_snap = snap_df[snap_df['Unit'].fillna('Other') == unit]
+                if not unit_snap.empty:
+                    lines_text = [f"【時間: {x_dt.strftime('%H:%M:%S')}】"]
+                    for _, row in unit_snap.sort_values('Sensor_Name').iterrows():
+                        u_str = row['Unit'] if pd.notna(row['Unit']) else ''
+                        lines_text.append(f"{row['Sensor_Name']}: {row['Raw_Value']} {u_str}".strip())
+
+                    full_text = "\n".join(lines_text)
+
+                    annot.xy = (x_num, event.ydata if event.ydata is not None else unit_snap['Raw_Value'].mean())
+                    annot.set_text(full_text)
+                    annot.set_visible(True)
+                else:
+                    annot.set_visible(False)
+
+            # 同時更新頂部文字面板（依 sensor 名稱排序，方便對照）
+            all_values_str = "   |   ".join([
+                f"{r['Sensor_Name']}: {r['Raw_Value']} {r['Unit'] if pd.notna(r['Unit']) else ''}".strip()
+                for _, r in snap_df.sort_values('Sensor_Name').iterrows()
+            ])
+            info_var.set(f"【時間: {x_dt.strftime('%Y-%m-%d %H:%M:%S')}】  {all_values_str}")
+
+            canvas.draw_idle()
+        except Exception:
+            pass
+
+    canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    # 綁定滑鼠移動事件
+    canvas.mpl_connect("motion_notify_event", on_mouse_move)
+
+    toolbar = NavigationToolbar2Tk(canvas, chart_frame)
+    toolbar.update()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+
+def get_selected_slot():
+    """ 回傳目前選擇的 Slot 編號；None 代表不限（單檔模式，或批次模式下選了「全部 Slot」） """
+    if current_df is None or 'Slot' not in current_df.columns:
+        return None
+    val = slot_combobox.get()
+    if not val or val == "[全部 Slot]":
+        return None
+    m = re.search(r'\d+', val)
+    return int(m.group()) if m else None
+
+
+def get_filtered_df(filter_key):
+    """ 依目前選擇的篩選條件（Slot + Sensor）回傳篩選後的數據（與繪圖、統計邏輯共用） """
+    df_filtered = current_df.dropna(subset=['Raw_Value']).copy()
+    df_filtered['Raw_Value'] = pd.to_numeric(df_filtered['Raw_Value'], errors='coerce')
+    df_filtered = df_filtered.dropna(subset=['Raw_Value'])
+
+    slot_no = get_selected_slot()
+    if slot_no is not None:
+        df_filtered = df_filtered[df_filtered['Slot'] == slot_no]
+
+    if filter_key != "[全部顯示]":
+        if filter_key.startswith("[群組] "):
+            kw = filter_key.replace("[群組] ", "")
+            df_filtered = filter_by_keyword_group(df_filtered, kw)
+        else:
+            df_filtered = df_filtered[df_filtered['Sensor_Name'] == filter_key]
+
+    return df_filtered
+
+
+def show_statistics():
+    """ 依目前篩選條件，統計每個 Sensor 的最大值/最小值/平均值 """
+    if current_df is None or current_df.empty:
+        messagebox.showwarning("提示", "請先開啟並解析 SDR 檔案。")
+        return
+
+    filter_key = sensor_combobox.get() or "[全部顯示]"
+    df_filtered = get_filtered_df(filter_key)
+
+    if df_filtered.empty:
+        messagebox.showwarning("提示", "此篩選條件下無可統計的數據。")
+        return
+
+    # 批次多 Slot 模式下，若目前選的是「全部 Slot」，則同時依 Sensor + Slot 分組，
+    # 方便一次比較所有 Slot 同一顆 Sensor 的最大/最小/平均值
+    has_multi_slot = 'Slot' in df_filtered.columns and df_filtered['Slot'].nunique() > 1
+    group_cols = ['Sensor_Name', 'Slot'] if has_multi_slot else ['Sensor_Name']
+
+    stats = df_filtered.groupby(group_cols).agg(
+        Unit=('Unit', 'first'),
+        Min=('Raw_Value', 'min'),
+        Max=('Raw_Value', 'max'),
+        Avg=('Raw_Value', 'mean'),
+        Count=('Raw_Value', 'count')
+    ).reset_index().sort_values(group_cols)
+
+    slot_label = slot_combobox.get() if 'Slot' in df_filtered.columns else ""
+    win = tk.Toplevel(root)
+    win.title(f"統計資訊 - {filter_key}" + (f" - {slot_label}" if slot_label else ""))
+    win.geometry("700x520")
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def export_csv():
+        save_path = filedialog.asksaveasfilename(
+            title="匯出統計資料",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if not save_path:
+            return
+        stats.to_csv(save_path, index=False, encoding='utf-8-sig')
+        messagebox.showinfo("完成", f"已匯出至：\n{save_path}")
+
+    export_btn = tk.Button(btn_frame, text="匯出 CSV", command=export_csv, padx=10, pady=3)
+    export_btn.pack(side=tk.RIGHT, padx=5, pady=5)
+
+    columns = ['sensor'] + (['slot'] if has_multi_slot else []) + ['unit', 'min', 'max', 'avg', 'count']
+    tree = ttk.Treeview(win, columns=columns, show='headings')
+    headings = {'sensor': 'Sensor', 'slot': 'Slot', 'unit': '單位', 'min': '最小值', 'max': '最大值', 'avg': '平均值', 'count': '筆數'}
+    widths = {'sensor': 220, 'slot': 60, 'unit': 70, 'min': 90, 'max': 90, 'avg': 90, 'count': 70}
+    for col in columns:
+        tree.heading(col, text=headings[col])
+        tree.column(col, width=widths[col], anchor='center')
+
+    for _, row in stats.iterrows():
+        values = [row['Sensor_Name']]
+        if has_multi_slot:
+            values.append(int(row['Slot']))
+        values += [
+            row['Unit'] if pd.notna(row['Unit']) else '',
+            f"{row['Min']:.2f}",
+            f"{row['Max']:.2f}",
+            f"{row['Avg']:.2f}",
+            int(row['Count'])
+        ]
+        tree.insert('', tk.END, values=values)
+
+    vsb = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+
+def select_and_process_file():
+    global current_df
+
+    file_path = filedialog.askopenfilename(
+        title="請選擇 SDR 文字檔",
+        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+    )
+    if not file_path:
+        return
+
+    try:
+        current_df = parse_sdr_log(file_path)
+        if current_df.empty:
+            messagebox.showwarning("警告", "未讀取到有效的 Sensor 資料。")
+            return
+
+        output_csv = os.path.splitext(file_path)[0] + "_parsed.csv"
+        current_df.to_csv(output_csv, index=False, encoding='utf-8-sig')
+
+        # 單檔模式：停用 Slot 篩選
+        slot_combobox.set("[全部 Slot]")
+        slot_combobox['values'] = ["[全部 Slot]"]
+        slot_combobox.config(state='disabled')
+
+        status_label.config(text=f"已解析 {len(current_df)} 條紀錄")
+        update_sensor_dropdown(current_df)
+        plot_sdr_data("[全部顯示]")
+
+    except Exception as e:
+        messagebox.showerror("錯誤", f"處理檔案時發生錯誤：\n{e}")
+
+
+def select_and_process_folder():
+    global current_df
+
+    folder_path = filedialog.askdirectory(
+        title="請選擇包含各 Slot 子資料夾的父資料夾"
+    )
+    if not folder_path:
+        return
+
+    root.config(cursor="watch")
+    status_label.config(text="正在掃描並解析資料夾中的所有 Slot，請稍候...")
+    root.update_idletasks()
+
+    try:
+        slot_files = find_slot_files(folder_path)
+        if not slot_files:
+            messagebox.showwarning("警告", "在此資料夾底下找不到任何含 'Slot' 編號子資料夾的 SDR 文字檔 (檔名需含 'sdr' 的 .txt)。")
+            status_label.config(text="請選擇要解析的 SDR 檔案")
+            return
+
+        combined_df, errors = parse_sdr_log_multi(slot_files)
+        if combined_df.empty:
+            messagebox.showwarning("警告", "找到 Slot 資料夾，但未能解析出任何有效的 Sensor 資料。")
+            status_label.config(text="請選擇要解析的 SDR 檔案")
+            return
+
+        current_df = combined_df
+        slot_nos = sorted(current_df['Slot'].unique().tolist())
+
+        slot_combobox.config(state='readonly')
+        slot_combobox['values'] = ["[全部 Slot]"] + [f"Slot {n}" for n in slot_nos]
+        slot_combobox.current(1)
+
+        status_label.config(text=f"已解析 {len(slot_nos)} 個 Slot，共 {len(current_df)} 條紀錄")
+        update_sensor_dropdown(current_df)
+        plot_sdr_data(sensor_combobox.get())
+
+        if errors:
+            preview = "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else "")
+            messagebox.showwarning("部分檔案解析失敗", preview)
+
+    except Exception as e:
+        messagebox.showerror("錯誤", f"處理資料夾時發生錯誤：\n{e}")
+    finally:
+        root.config(cursor="")
+
+
+def on_sensor_selected(event):
+    selected = sensor_combobox.get()
+    plot_sdr_data(selected)
+
+
+def on_slot_selected(event):
+    plot_sdr_data(sensor_combobox.get() or "[全部顯示]")
+
+
+# ==================== GUI 介面建立 ====================
+root = tk.Tk()
+root.title("SDR Log 圖形化分析與動態游標工具")
+root.geometry("1150x800")
+
+# 1. 頂部操作按鈕列
+top_frame = tk.Frame(root)
+top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+
+select_btn = tk.Button(top_frame, text="開啟 SDR 文字檔 (.txt)", font=("Microsoft JhengHei", 10, "bold"), command=select_and_process_file, bg="#0078D7", fg="white", padx=10, pady=3)
+select_btn.pack(side=tk.LEFT, padx=5)
+
+select_folder_btn = tk.Button(top_frame, text="開啟資料夾 (批次多 Slot)", font=("Microsoft JhengHei", 10, "bold"), command=select_and_process_folder, bg="#5C2D91", fg="white", padx=10, pady=3)
+select_folder_btn.pack(side=tk.LEFT, padx=5)
+
+dropdown_label = tk.Label(top_frame, text=" 篩選項目/Sensor: ", font=("Microsoft JhengHei", 10))
+dropdown_label.pack(side=tk.LEFT, padx=(10, 2))
+
+sensor_combobox = ttk.Combobox(top_frame, state="readonly", width=25, font=("Microsoft JhengHei", 10))
+sensor_combobox.pack(side=tk.LEFT, padx=5)
+sensor_combobox.bind("<<ComboboxSelected>>", on_sensor_selected)
+
+slot_label = tk.Label(top_frame, text=" Slot: ", font=("Microsoft JhengHei", 10))
+slot_label.pack(side=tk.LEFT, padx=(10, 2))
+
+slot_combobox = ttk.Combobox(top_frame, state="disabled", width=12, font=("Microsoft JhengHei", 10), values=["[全部 Slot]"])
+slot_combobox.set("[全部 Slot]")
+slot_combobox.pack(side=tk.LEFT, padx=5)
+slot_combobox.bind("<<ComboboxSelected>>", on_slot_selected)
+
+stats_btn = tk.Button(top_frame, text="統計 Min/Max/Avg", font=("Microsoft JhengHei", 10), command=show_statistics, bg="#28A745", fg="white", padx=10, pady=3)
+stats_btn.pack(side=tk.LEFT, padx=5)
+
+status_label = tk.Label(top_frame, text="請選擇要解析的 SDR 檔案", font=("Microsoft JhengHei", 9), fg="gray")
+status_label.pack(side=tk.LEFT, padx=15)
+
+# 2. 當前時間與數值即時顯示面板
+info_frame = tk.Frame(root, bg="#1E1E1E", bd=2, relief=tk.SUNKEN)
+info_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=3)
+
+info_var = tk.StringVar()
+info_var.set("【將滑鼠移至圖表上，即時檢視該時間點所有 Sensor 數值】")
+
+info_label = tk.Label(info_frame, textvariable=info_var, font=("Consolas", 10, "bold"), fg="#00FF66", bg="#1E1E1E", anchor="w", justify=tk.LEFT, padx=10, pady=5)
+info_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+# 3. 下方圖表顯示區域
+chart_frame = tk.Frame(root)
+chart_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+root.mainloop()
