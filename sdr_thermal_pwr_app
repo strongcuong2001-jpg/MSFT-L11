@@ -1,1 +1,897 @@
+# -*- coding: utf-8 -*-
+"""
+SDR Thermal & PWR Margin 資料收集工具 (單一檔案版，桌面應用程式，Tkinter)
 
+不需要瀏覽器、不需要開網頁，只有這一個檔案。在 VSCode 開著這個檔案，
+按右上角的播放鈕 (或用 `python sdr_thermal_pwr_app.py`) 就會彈出桌面視窗。
+
+使用方式：
+  1. 選 Excel 模板 (預設會自動帶入找得到的模板)
+  2. 貼上「SDR log 上層資料夾」與「NVQual 上層資料夾」的路徑，按「自動比對」
+     (也可以每個 Slot 各自選檔案/資料夾)
+  3. 按「開始解析並產生 Excel」
+
+資料規則 (已與使用者確認)：
+  * SDR log 的項目：整份 log 裡「各感測器各自」的最大值 (不是同一時間點)。
+    TLIMIT / TMPLIMIT 這幾列取最小值。OVL_S1_* 對應 log 裡的 PyP_S1_*。
+  * GPU / CPU 的溫度與瓦數：不是從 SDR log 抓，而是從 NVQual 報表 Excel：
+      - GPU 取 Test_1_GPU_GPUONLY_TDP 的 Avg TJAvg / Avg GPU Power
+      - CPU 取 Test_1_CPU_SYSTEM_TDPMAX 的 Avg CPU TJAvg / Avg Total CPU Power
+      - 每個 Slot 有多次 run，取所有 run 裡的最大值
+      - GPU 依 PCIe 編號對應：GPU0=0002:81:00.0  GPU1=0002:c1:00.0
+                              GPU2=000a:81:00.0  GPU3=000a:e1:00.0
+      - Socket 0 -> M0_CPU，Socket 1 -> M1_CPU
+      - GPU_PWR_SUM = GPU0~3 瓦數相加
+  * Lion Chip 維持空白；log 裡沒有的項目 (例如 OSFP) 也維持空白。
+  * Margin = Temp Spec − Temp；沒有 Spec 的項目 (PWR) 填 NA。
+
+------------------------------------------------------------------------
+以下分成兩大塊：
+  第一部分：核心邏輯（讀 log、讀 NVQual 報表、填 Excel、自動比對 Slot 資料夾）
+  第二部分：Tkinter 桌面視窗介面
+兩塊都寫在同一個檔案裡，之後要更新只要維護這一個 .py 檔即可。
+------------------------------------------------------------------------
+"""
+
+import os
+import re
+import io
+import sys
+import queue
+import shutil
+import tarfile
+import tempfile
+import threading
+import traceback
+from datetime import datetime
+
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+
+# ============================================================================
+# 第一部分：核心邏輯
+# ============================================================================
+
+# ------------------------------------------------------------------
+# 1. 設定
+# ------------------------------------------------------------------
+
+# 模板中實際使用的 18 個 Slot 編號 (注意不是連續的 1~18)
+SLOT_NUMBERS = [8, 9, 10, 11, 12, 13, 14, 15,
+                27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
+
+# NVQual 報表裡要讀的工作表 (要換測試階段只要改這兩行)
+GPU_SHEET = "Test_1_GPU_GPUONLY_TDP"
+CPU_SHEET = "Test_1_CPU_SYSTEM_TDPMAX"
+
+# GPU 編號 -> 報表裡的 PCIe 位址
+GPU_PCIE = {0: "0002:81:00.0", 1: "0002:c1:00.0", 2: "000a:81:00.0", 3: "000a:e1:00.0"}
+
+# 模板項目名稱 -> log 裡實際的 sensor 名稱
+SDR_ALIAS = {"OVL_S1_SOC_TMP": "PyP_S1_SOC_TMP", "OVL_S1_POWER": "PyP_S1_POWER"}
+
+# 這些項目一律留空 (項目名稱第一個字)
+BLANK_KEYS = {"Lion"}
+
+# 這些項目「只」從 NVQual 報表取值，即使 SDR log 裡有同名 sensor 也不用
+NVQUAL_ONLY_KEYS = (
+    {f"GPU{i}_AVG_TMP" for i in range(4)}
+    | {f"GPU{i}_PWR" for i in range(4)}
+    | {"GPU_PWR_SUM", "M0_CPU_PWR0", "M1_CPU_PWR0", "M0_CPU_TMPAVG0", "M1_CPU_TMPAVG0"}
+)
+
+SPEC_COL = 3  # C欄
+
+# 預設模板候選位置 (依序找第一個存在的)
+DEFAULT_TEMPLATE_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "SDR Thermal and PWR margin template.xlsx"),
+    r"C:\Users\USER04\Desktop\Fii project\SDR_Thermal_App\template\SDR Thermal and PWR margin template.xlsx",
+    r"C:\Users\USER04\Desktop\Fii project\Thermal_Margin excel and template\SDR Thermal and PWR margin template.xlsx",
+]
+
+# 從名稱裡找 "SlotN" (不分大小寫，Slot/slot 中間可以有底線或空白)
+# 用 (?<!\d) 和 (?!\d) 確保不會把 Slot1 誤配到 Slot10/Slot11 這種情況
+SLOT_NAME_RE = re.compile(r"(?<!\d)slot[\s_-]*?(\d+)(?!\d)", re.IGNORECASE)
+REPORT_RE = re.compile(r"^nvqual_report_\d{8}_\d{6}\.xlsx$", re.IGNORECASE)
+ARCHIVE_RE = re.compile(r"(?<!\d)slot[\s_-]*?(\d+)(?!\d).*\.(tar|tgz|tar\.gz)$", re.IGNORECASE)
+TS_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s*$")
+
+CACHE_ROOT = os.path.join(tempfile.gettempdir(), "sdr_thermal_pwr_cache")
+
+
+def slot_of(path: str):
+    """取路徑中「最後一個」SlotN 的 N；找不到回傳 None。"""
+    hits = SLOT_NAME_RE.findall(path)
+    return int(hits[-1]) if hits else None
+
+
+def item_key(label) -> str:
+    """'E1S_1_TMP (BayC)' -> 'E1S_1_TMP'；'Lion Chip' -> 'Lion'。"""
+    parts = str(label or "").split()
+    return parts[0] if parts else ""
+
+
+def is_min_key(name: str) -> bool:
+    return "TLIMIT" in name or "TMPLIMIT" in name
+
+
+def clean_path(text: str) -> str:
+    """接受貼上來的路徑 (含引號、前後空白、file:/// 開頭)。"""
+    t = (text or "").strip().strip('"').strip("'").strip()
+    return t[8:] if t.lower().startswith("file:///") else t
+
+
+# ------------------------------------------------------------------
+# 2. SDR log 解析
+# ------------------------------------------------------------------
+
+def resolve_sdr_files(user_path: str):
+    """
+    使用者輸入可能是：
+      - 直接的 log 檔案路徑 (.txt/.log)
+      - 資料夾路徑 (裡面放 log 檔，可能還包了一層同名子資料夾)
+    回傳 ([檔案路徑...], 附帶訊息 或 None)
+    """
+    user_path = clean_path(user_path)
+    if not user_path:
+        return [], "路徑空白"
+
+    if os.path.isfile(user_path):
+        return [user_path], None
+
+    if not os.path.isdir(user_path):
+        return [], f"找不到這個路徑：{user_path}"
+
+    txts = []
+    for root, _dirs, files in os.walk(user_path):
+        for fn in files:
+            if fn.lower().endswith((".txt", ".log")):
+                full = os.path.join(root, fn)
+                txts.append((os.path.getsize(full), full))
+    if not txts:
+        return [], f"資料夾(含子資料夾)內找不到 .txt/.log 檔案：{user_path}"
+
+    sdr = [f for _, f in txts if os.path.basename(f).lower().startswith("sdr_test_")]
+    if sdr:
+        return sorted(sdr), None
+    best = max(txts)[1]
+    return [best], f"找不到 sdr_test_*.txt，已自動選用檔案最大的：{os.path.basename(best)}"
+
+
+def parse_sdr_files(files):
+    """
+    掃描整份 log，每個 sensor 各自記錄「整段測試期間」的 [最小值, 最大值]。
+    log 每行格式類似：
+        SENSOR_NAME      | 48 degrees C      | ok
+        HSC0_INPUT_PWR   | 15 Watts          | ok
+    回傳 (stats, samples)：stats = { sensor: [min, max] }，samples = 取樣時間點數量
+    """
+    stats = {}
+    samples = 0
+    for path in files:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if TS_RE.match(line):
+                    samples += 1
+                    continue
+                parts = line.split("|")
+                if len(parts) < 3:
+                    continue
+                tok = parts[1].split()
+                if not tok or tok[0].lower().startswith("0x"):
+                    continue  # 略過 0x01 這種狀態值
+                try:
+                    val = float(tok[0])
+                except ValueError:
+                    continue
+                key = parts[0].strip()
+                s = stats.get(key)
+                if s is None:
+                    stats[key] = [val, val]
+                else:
+                    if val < s[0]:
+                        s[0] = val
+                    if val > s[1]:
+                        s[1] = val
+    return stats, samples
+
+
+# ------------------------------------------------------------------
+# 3. NVQual 報表 (GPU / CPU 的溫度與瓦數)
+# ------------------------------------------------------------------
+
+def extract_reports(archive: str, slot: int):
+    """從 Slot 的 .tar/.tgz 裡只抽出 nvqual_report_*.xlsx (有快取，第二次不用重抽)。"""
+    st = os.stat(archive)
+    dest = os.path.join(CACHE_ROOT, f"Slot{slot}_{st.st_size}_{int(st.st_mtime)}")
+    marker = os.path.join(dest, ".done")
+    if not os.path.exists(marker):
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest, exist_ok=True)
+        mode = "r:" if archive.lower().endswith(".tar") else "r:gz"
+        with tarfile.open(archive, mode) as t:
+            for m in t:
+                base = os.path.basename(m.name)
+                if m.isfile() and REPORT_RE.match(base):
+                    m.name = base
+                    try:
+                        t.extract(m, dest, filter="data")
+                    except TypeError:  # 舊版 Python 沒有 filter 參數
+                        t.extract(m, dest)
+        open(marker, "w").close()
+    return sorted(os.path.join(dest, f) for f in os.listdir(dest) if REPORT_RE.match(f))
+
+
+def resolve_nvqual_reports(user_path: str, slot: int):
+    """
+    使用者輸入可能是：Slot 的 .tar/.tgz 檔、已解壓的資料夾 (含 nvqual_report_*.xlsx)、
+    或存放 .tar/.tgz 的資料夾。回傳 ([報表路徑...], 附帶訊息 或 None)
+    """
+    user_path = clean_path(user_path)
+    if not user_path:
+        return [], "路徑空白"
+
+    if os.path.isfile(user_path):
+        low = user_path.lower()
+        if low.endswith((".tar", ".tgz", ".tar.gz")):
+            return extract_reports(user_path, slot), None
+        if REPORT_RE.match(os.path.basename(user_path)):
+            return [user_path], None
+        return [], f"不是 .tar/.tgz 也不是 nvqual_report 檔：{user_path}"
+
+    if not os.path.isdir(user_path):
+        return [], f"找不到這個路徑：{user_path}"
+
+    reports, archives = [], []
+    for root, _dirs, files in os.walk(user_path):
+        for fn in files:
+            full = os.path.join(root, fn)
+            if REPORT_RE.match(fn):
+                reports.append(full)
+            elif ARCHIVE_RE.search(fn):
+                archives.append(full)
+    if reports:
+        return sorted(reports), None
+    # 資料夾裡放的是壓縮檔：只取跟這個 Slot 相符的，.tar 優先 (比 .tgz 快)
+    mine = [a for a in archives if slot_of(os.path.basename(a)) == slot]
+    if not mine:
+        return [], f"資料夾內找不到 Slot {slot} 的 .tar/.tgz 或 nvqual_report 檔"
+    mine.sort(key=lambda p: (not p.lower().endswith(".tar"), p))
+    return extract_reports(mine[0], slot), None
+
+
+def read_report(path: str):
+    """讀一份 NVQual 報表，回傳 ({模板項目名稱: Avg數值}, [提醒訊息])。"""
+    vals, notes = {}, []
+    wb = openpyxl.load_workbook(path, read_only=True)
+    try:
+        def table(sheet, prefix):
+            if sheet not in wb.sheetnames:
+                notes.append(f"{os.path.basename(path)}: 找不到工作表 {sheet}")
+                return {}
+            hdr, rows = None, {}
+            for row in wb[sheet].iter_rows(min_row=1, max_row=40, values_only=True):
+                if row[0] == "System Thermal Qualification Test Summary":
+                    hdr = list(row)
+                elif hdr and row[0] and str(row[0]).startswith(prefix):
+                    rows[str(row[0])] = dict(zip(hdr, row))
+            return rows
+
+        def avg(row, *words):
+            for k, v in row.items():
+                if k and k.startswith("Avg.") and all(w in k for w in words):
+                    return v
+            return None
+
+        gpus = table(GPU_SHEET, "GPU ")
+        for i, pcie in GPU_PCIE.items():
+            r = gpus.get("GPU " + pcie)
+            if r:
+                vals[f"GPU{i}_AVG_TMP"] = avg(r, "TJAvg")
+                vals[f"GPU{i}_PWR"] = avg(r, "GPU Power")
+        cpus = table(CPU_SHEET, "Socket ")
+        for s in (0, 1):
+            r = cpus.get(f"Socket {s}")
+            if r:
+                vals[f"M{s}_CPU_PWR0"] = avg(r, "Total CPU Power")
+                vals[f"M{s}_CPU_TMPAVG0"] = avg(r, "CPU TJAvg")
+    finally:
+        wb.close()
+    return {k: v for k, v in vals.items() if isinstance(v, (int, float))}, notes
+
+
+def collect_nvqual(reports):
+    """讀取所有 run 的報表，每個項目取最大值。回傳 (values, notes)。"""
+    best, notes = {}, []
+    for rp in reports:
+        try:
+            v, n = read_report(rp)
+        except Exception as e:
+            notes.append(f"{os.path.basename(rp)}: 讀取失敗 - {e}")
+            continue
+        notes += n
+        for k, x in v.items():
+            if k not in best or x > best[k]:
+                best[k] = x
+    if all(f"GPU{i}_PWR" in best for i in range(4)):
+        best["GPU_PWR_SUM"] = sum(best[f"GPU{i}_PWR"] for i in range(4))
+    return best, notes
+
+
+# ------------------------------------------------------------------
+# 4. 自動比對「上層資料夾」底下的內容 -> Slot 編號
+# ------------------------------------------------------------------
+
+def _new_match_result():
+    return {"matched": {}, "unmatched_folders": [], "missing_slots": list(SLOT_NUMBERS),
+            "ambiguous": [], "error": None}
+
+
+def auto_match_slot_folders(parent_dir: str):
+    """
+    掃描 parent_dir 底下「第一層」子資料夾，依名稱裡的 SlotN 自動對應到
+    18 個 Slot 編號 (用在 SDR log 上層資料夾)。
+
+    回傳 dict:
+      matched            {slot_num: folder_path}
+      unmatched_folders  名稱裡沒找到 SlotN、或編號不在 18 個裡的
+      missing_slots      18 個裡沒配到資料夾的
+      ambiguous          同一個 slot 配到超過一個資料夾 (取第一個，其餘列在這)
+      error              None 或錯誤訊息字串
+    """
+    result = _new_match_result()
+    parent_dir = clean_path(parent_dir)
+    if not parent_dir or not os.path.isdir(parent_dir):
+        result["error"] = f"找不到這個資料夾：{parent_dir}"
+        return result
+    try:
+        entries = [n for n in sorted(os.listdir(parent_dir))
+                   if os.path.isdir(os.path.join(parent_dir, n))]
+    except OSError as e:
+        result["error"] = f"讀取資料夾失敗：{e}"
+        return result
+
+    matched = {}
+    for name in entries:
+        m = SLOT_NAME_RE.search(name)
+        if not m or int(m.group(1)) not in SLOT_NUMBERS:
+            result["unmatched_folders"].append(name)
+            continue
+        slot_num = int(m.group(1))
+        if slot_num in matched:
+            result["ambiguous"].append((slot_num, name))
+        else:
+            matched[slot_num] = os.path.join(parent_dir, name)
+    result["matched"] = matched
+    result["missing_slots"] = [s for s in SLOT_NUMBERS if s not in matched]
+    return result
+
+
+def auto_match_nvqual(parent_dir: str):
+    """
+    掃描 parent_dir (含所有子層)，找出每個 Slot 的 NVQual 資料：
+    優先用 SlotN.tar / SlotN.tgz 壓縮檔 (.tar 優先)，沒有壓縮檔就用已解壓的 SlotN 資料夾。
+    回傳格式與 auto_match_slot_folders 相同。
+    """
+    result = _new_match_result()
+    parent_dir = clean_path(parent_dir)
+    if not parent_dir or not os.path.isdir(parent_dir):
+        result["error"] = f"找不到這個資料夾：{parent_dir}"
+        return result
+
+    archives, folders = {}, {}
+    parent_abs = os.path.abspath(parent_dir)
+    for root, _dirs, files in os.walk(parent_abs):
+        for fn in files:
+            full = os.path.join(root, fn)
+            m = ARCHIVE_RE.search(fn)
+            if m:
+                s = int(m.group(1))
+                if s not in SLOT_NUMBERS:
+                    continue
+                if s in archives:
+                    # .tar 比 .tgz 快，取 .tar；其餘重複的列入 ambiguous
+                    if full.lower().endswith(".tar") and not archives[s].lower().endswith(".tar"):
+                        archives[s] = full
+                    continue
+                archives[s] = full
+            elif REPORT_RE.match(fn):
+                # 往上找「離 parent 最近、名稱含 SlotN」的最上層資料夾當作這個 Slot 的根
+                rel = os.path.relpath(root, parent_abs).split(os.sep)
+                top = None
+                for i, part in enumerate(rel):
+                    m2 = SLOT_NAME_RE.search(part)
+                    if m2 and int(m2.group(1)) in SLOT_NUMBERS:
+                        top = (int(m2.group(1)), os.path.join(parent_abs, *rel[:i + 1]))
+                        break
+                if top:
+                    folders.setdefault(top[0], top[1])
+
+    matched = dict(folders)
+    matched.update(archives)  # 壓縮檔優先
+    result["matched"] = matched
+    result["missing_slots"] = [s for s in SLOT_NUMBERS if s not in matched]
+    return result
+
+
+# ------------------------------------------------------------------
+# 5. 填寫 Excel
+# ------------------------------------------------------------------
+
+def template_layout(ws):
+    """回傳 ({slot: Temp欄位col_idx}, {項目列: key})，都是從模板本身讀出來的。"""
+    slot_cols = {}
+    for c in range(4, ws.max_column + 1):
+        m = re.match(r"Slot (\d+)", str(ws.cell(1, c).value or ""))
+        if m:
+            slot_cols[int(m.group(1))] = c
+    if not slot_cols:  # 模板沒有標 Slot 表頭時，退回「Slot8 從 D 欄開始，每個 Slot 2 欄」
+        slot_cols = {s: 4 + 2 * i for i, s in enumerate(SLOT_NUMBERS)}
+    head = next((r for r in range(1, 15) if ws.cell(r, 2).value == "Item"), 7)
+    rows = {r: item_key(ws.cell(r, 2).value)
+            for r in range(head + 1, ws.max_row + 1) if ws.cell(r, 2).value}
+    return slot_cols, rows, head
+
+
+def normalize_gpu_rows(ws, rows):
+    """
+    GPU 相關列依「出現順序」重新命名為 GPU0~GPU3 並加上 PCIe 編號
+    (舊模板把瓦數寫成 GPU1~GPU4，這裡一併修正)。
+    """
+    for pattern, fmt in ((r"GPU\d_AVG_TMP", "GPU{i}_AVG_TMP"), (r"GPU\d_PWR", "GPU{i}_PWR")):
+        hit = [r for r, k in rows.items() if re.fullmatch(pattern, k)]
+        for i, r in enumerate(hit[:4]):
+            rows[r] = fmt.format(i=i)
+            ws.cell(r, 2).value = f"{rows[r]} ({GPU_PCIE[i]})"
+
+
+def value_for(key, sdr_stats, nvq_vals):
+    """決定這個項目要填什麼數值；沒有資料回傳 None (留空)。"""
+    if key in BLANK_KEYS:
+        return None
+    if key in NVQUAL_ONLY_KEYS:
+        return nvq_vals.get(key)
+    name = SDR_ALIAS.get(key, key)
+    s = sdr_stats.get(name)
+    if not s:
+        return None
+    return s[0] if is_min_key(name) else s[1]
+
+
+def process_excel(template_bytes: bytes, slot_sdr: dict, slot_nvq: dict, output_path: str, progress=None):
+    """
+    slot_sdr / slot_nvq: { slot_number(int): user_input_path(str) }
+    回傳: (output_path, status_messages, preview_data)
+    preview_data: { sensor_label: { "Slot N": value } }
+    """
+    say = progress or (lambda m: None)
+    wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
+    ws = wb.worksheets[0]
+    slot_cols, rows, head = template_layout(ws)
+    normalize_gpu_rows(ws, rows)
+    labels = {r: str(ws.cell(r, 2).value).strip() for r in rows}
+
+    # 先清掉模板裡舊的/示範性質的殘留數值，避免跟新資料混在一起。
+    # 注意：openpyxl 的 ws.cell(row, column, value=None) 不會清空儲存格，
+    # 必須直接對 cell.value 賦值才能真正清空。
+    for slot, col in slot_cols.items():
+        ws.cell(row=head, column=col).value = "Temp"
+        ws.cell(row=head, column=col + 1).value = "Margin"
+        for r in rows:
+            ws.cell(row=r, column=col).value = None
+            ws.cell(row=r, column=col + 1).value = None
+
+    status_messages = []
+    preview_data = {labels[r]: {} for r in rows}
+    details = []
+
+    for slot in SLOT_NUMBERS:
+        sdr_raw = (slot_sdr.get(slot) or "").strip()
+        nvq_raw = (slot_nvq.get(slot) or "").strip()
+        if not sdr_raw and not nvq_raw:
+            continue  # 使用者沒填這個 slot，跳過
+        col = slot_cols.get(slot)
+        if col is None:
+            status_messages.append(f"Slot {slot}: 模板表頭找不到這個 Slot，已略過")
+            continue
+
+        sdr_stats, samples, sdr_files, nvq_vals, runs = {}, 0, [], {}, []
+
+        if sdr_raw:
+            say(f"Slot {slot}: 讀取 SDR log...")
+            sdr_files, msg = resolve_sdr_files(sdr_raw)
+            if msg:
+                status_messages.append(f"Slot {slot}: {msg}")
+            if sdr_files:
+                try:
+                    sdr_stats, samples = parse_sdr_files(sdr_files)
+                except Exception as e:
+                    status_messages.append(f"Slot {slot}: SDR log 讀取失敗 - {e}")
+        else:
+            status_messages.append(f"Slot {slot}: 沒有填 SDR log，SDR 項目留空")
+
+        if nvq_raw:
+            say(f"Slot {slot}: 讀取 NVQual 報表...")
+            try:
+                reports, msg = resolve_nvqual_reports(nvq_raw, slot)
+                if msg:
+                    status_messages.append(f"Slot {slot}: {msg}")
+                if reports:
+                    nvq_vals, notes = collect_nvqual(reports)
+                    status_messages += [f"Slot {slot}: {n}" for n in notes]
+                    runs = [os.path.basename(r)[len("nvqual_report_"):-len(".xlsx")] for r in reports]
+            except Exception as e:
+                status_messages.append(f"Slot {slot}: NVQual 讀取失敗 - {e}")
+        else:
+            status_messages.append(f"Slot {slot}: 沒有填 NVQual，GPU/CPU 項目留空")
+
+        temp_letter = get_column_letter(col)
+        blanks = []
+        for r, key in rows.items():
+            val = value_for(key, sdr_stats, nvq_vals)
+            if val is None:
+                if key not in BLANK_KEYS:
+                    blanks.append(labels[r])
+                continue
+            val = round(float(val), 2)
+            ws.cell(row=r, column=col, value=val)
+            preview_data[labels[r]][f"Slot {slot}"] = val
+
+            spec_val = ws.cell(row=r, column=SPEC_COL).value
+            if isinstance(spec_val, (int, float)):
+                ws.cell(row=r, column=col + 1,
+                        value=f"={get_column_letter(SPEC_COL)}{r}-{temp_letter}{r}")
+            else:
+                ws.cell(row=r, column=col + 1, value="NA")
+        if blanks:
+            status_messages.append(f"Slot {slot}: 以下項目沒有資料，已留空：{', '.join(blanks)}")
+        details.append([slot, "; ".join(sdr_files), samples, ", ".join(runs), ", ".join(blanks)])
+
+    ts = wb.create_sheet("Source details")
+    ts.append(["Slot", "SDR file(s)", "SDR samples", "NVQual runs used (max across runs)", "Blank items"])
+    for d in details:
+        ts.append(d)
+    ts.append([])
+    ts.append(["SDR 項目 = 整份 log 各感測器各自最大值 (TLIMIT/TMPLIMIT = 最小值)；"
+               "GPU/CPU 項目 = 所有 NVQual run 的 Avg 值取最大；Margin = Temp Spec − Temp。"])
+
+    say("儲存 Excel...")
+    wb.save(output_path)
+    return output_path, status_messages, preview_data
+
+
+# ============================================================================
+# 第二部分：Tkinter 桌面視窗介面
+# ============================================================================
+
+APP_TITLE = "SDR Thermal & PWR Margin 資料收集工具"
+
+
+class SdrApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1240x860")
+        self.minsize(1000, 640)
+
+        default_tpl = next((p for p in DEFAULT_TEMPLATE_CANDIDATES if os.path.isfile(p)), "")
+        self.template_path_var = tk.StringVar(value=default_tpl)
+        self.sdr_parent_var = tk.StringVar(value="")
+        self.nvq_parent_var = tk.StringVar(value="")
+        self.sdr_vars = {slot: tk.StringVar(value="") for slot in SLOT_NUMBERS}
+        self.nvq_vars = {slot: tk.StringVar(value="") for slot in SLOT_NUMBERS}
+        self._queue = queue.Queue()  # 背景執行緒 -> 主執行緒 (Tk 不能直接在別的執行緒操作)
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI 建構
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        # ---- 說明文字 ----
+        intro = (
+            "1. 選擇 Excel 模板 (已自動帶入預設模板)\n"
+            "2. 貼上「SDR log 上層資料夾」與「NVQual 上層資料夾」路徑後按「自動比對」，"
+            "或針對每個 Slot 各自選檔案/資料夾\n"
+            "3. 按「開始解析並產生 Excel」，選擇要存到哪裡\n\n"
+            "SDR 項目：整份 log 裡各感測器「各自」的最大值 (非同一時間點；TLIMIT 列取最小值)。"
+            "GPU/CPU 溫度與瓦數：取自 NVQual 報表，所有 run 取最大值。"
+            "Margin = Temp Spec − Temp；沒有 Spec 的項目 (PWR) 不計算 Margin。"
+        )
+        ttk.Label(self, text=intro, justify="left", wraplength=1200).pack(fill="x", padx=12, pady=(10, 6))
+
+        # ---- 模板選擇 ----
+        template_frame = ttk.Frame(self)
+        template_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(template_frame, text="📄 選擇 Excel 模板...", command=self.select_template).pack(side="left")
+        ttk.Label(template_frame, textvariable=self.template_path_var, foreground="#0a6").pack(side="left", padx=8)
+
+        # ---- 一次貼上上層資料夾，自動比對 18 個 Slot ----
+        auto_frame = ttk.LabelFrame(self, text="快速設定（貼上上層資料夾路徑，自動比對 18 個 Slot）")
+        auto_frame.pack(fill="x", padx=12, pady=(0, 8))
+        auto_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(auto_frame, text="SDR log 資料夾").grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        e1 = ttk.Entry(auto_frame, textvariable=self.sdr_parent_var)
+        e1.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(auto_frame, text="瀏覽...", width=8,
+                   command=lambda: self.browse_parent(self.sdr_parent_var)).grid(row=0, column=2, padx=2)
+        ttk.Button(auto_frame, text="自動比對", width=9,
+                   command=self.match_sdr).grid(row=0, column=3, padx=(2, 6))
+        e1.bind("<Return>", lambda _e: self.match_sdr())
+
+        ttk.Label(auto_frame, text="NVQual 資料夾").grid(row=1, column=0, padx=6, pady=4, sticky="w")
+        e2 = ttk.Entry(auto_frame, textvariable=self.nvq_parent_var)
+        e2.grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Button(auto_frame, text="瀏覽...", width=8,
+                   command=lambda: self.browse_parent(self.nvq_parent_var)).grid(row=1, column=2, padx=2)
+        ttk.Button(auto_frame, text="自動比對", width=9,
+                   command=self.match_nvqual).grid(row=1, column=3, padx=(2, 6))
+        e2.bind("<Return>", lambda _e: self.match_nvqual())
+
+        # ---- 18 個 Slot 輸入區 (可捲動) ----
+        slots_outer = ttk.LabelFrame(self, text="Slot 路徑設定（SDR log / NVQual 報表）")
+        slots_outer.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        canvas = tk.Canvas(slots_outer, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(slots_outer, orient="vertical", command=canvas.yview)
+        self.slots_frame = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=self.slots_frame, anchor="nw")
+
+        self.slots_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 滑鼠滾輪捲動 (Windows)
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        self.slots_frame.columnconfigure(1, weight=1)
+        self.slots_frame.columnconfigure(5, weight=1)
+        ttk.Label(self.slots_frame, text="SDR log 檔案/資料夾", foreground="#666").grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(self.slots_frame, text="NVQual .tar/.tgz 或資料夾", foreground="#666").grid(row=0, column=5, sticky="w", padx=4)
+        for i, slot in enumerate(SLOT_NUMBERS, start=1):
+            ttk.Label(self.slots_frame, text=f"Slot {slot}", width=8).grid(row=i, column=0, padx=4, pady=2)
+            ttk.Entry(self.slots_frame, textvariable=self.sdr_vars[slot]).grid(row=i, column=1, sticky="ew", padx=4)
+            ttk.Button(self.slots_frame, text="檔案", width=5,
+                       command=lambda s=slot: self.browse_sdr_file(s)).grid(row=i, column=2, padx=1)
+            ttk.Button(self.slots_frame, text="資料夾", width=7,
+                       command=lambda s=slot: self.browse_folder(self.sdr_vars[s], f"Slot {s} 的 SDR log 資料夾")
+                       ).grid(row=i, column=3, padx=1)
+            ttk.Separator(self.slots_frame, orient="vertical").grid(row=i, column=4, sticky="ns", padx=4)
+            ttk.Entry(self.slots_frame, textvariable=self.nvq_vars[slot]).grid(row=i, column=5, sticky="ew", padx=4)
+            ttk.Button(self.slots_frame, text="檔案", width=5,
+                       command=lambda s=slot: self.browse_nvq_file(s)).grid(row=i, column=6, padx=1)
+            ttk.Button(self.slots_frame, text="資料夾", width=7,
+                       command=lambda s=slot: self.browse_folder(self.nvq_vars[s], f"Slot {s} 的 NVQual 資料夾")
+                       ).grid(row=i, column=7, padx=(1, 4))
+
+        # ---- 操作按鈕 ----
+        action_frame = ttk.Frame(self)
+        action_frame.pack(fill="x", padx=12, pady=(0, 8))
+        self.run_button = ttk.Button(action_frame, text="🚀 開始解析並產生 Excel", command=self.on_run_clicked)
+        self.run_button.pack(side="left")
+        ttk.Button(action_frame, text="🧹 清空所有 Slot 路徑", command=self.clear_slots).pack(side="left", padx=8)
+        self.status_label = ttk.Label(action_frame, text="", foreground="#666")
+        self.status_label.pack(side="left", padx=8)
+
+        # ---- 結果 / 訊息輸出區 ----
+        log_frame = ttk.LabelFrame(self, text="處理訊息")
+        log_frame.pack(fill="both", expand=False, padx=12, pady=(0, 12))
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+
+    # ------------------------------------------------------------------
+    # 事件處理
+    # ------------------------------------------------------------------
+    def select_template(self):
+        path = filedialog.askopenfilename(title="選擇 Excel 模板", filetypes=[("Excel 檔案", "*.xlsx")])
+        if path:
+            self.template_path_var.set(path)
+
+    def browse_parent(self, var):
+        path = filedialog.askdirectory(title="選擇上層資料夾")
+        if path:
+            var.set(path)
+
+    def browse_folder(self, var, title):
+        path = filedialog.askdirectory(title=title)
+        if path:
+            var.set(path)
+
+    def browse_sdr_file(self, slot):
+        path = filedialog.askopenfilename(
+            title=f"選擇 Slot {slot} 的 log 檔案",
+            filetypes=[("Log / 文字檔", "*.txt *.log"), ("所有檔案", "*.*")],
+        )
+        if path:
+            self.sdr_vars[slot].set(path)
+
+    def browse_nvq_file(self, slot):
+        path = filedialog.askopenfilename(
+            title=f"選擇 Slot {slot} 的 NVQual 壓縮檔或報表",
+            filetypes=[("NVQual 壓縮檔 / 報表", "*.tar *.tgz *.gz *.xlsx"), ("所有檔案", "*.*")],
+        )
+        if path:
+            self.nvq_vars[slot].set(path)
+
+    def match_sdr(self):
+        self._apply_match("SDR log", self.sdr_parent_var.get(), auto_match_slot_folders, self.sdr_vars)
+
+    def match_nvqual(self):
+        self._apply_match("NVQual", self.nvq_parent_var.get(), auto_match_nvqual, self.nvq_vars)
+
+    def _apply_match(self, what, parent_dir, matcher, target_vars, clear=True):
+        parent_dir = clean_path(parent_dir)
+        if not parent_dir:
+            messagebox.showwarning("提醒", f"請先貼上或選擇 {what} 的上層資料夾")
+            return
+        result = matcher(parent_dir)
+        if result["error"]:
+            messagebox.showerror("錯誤", result["error"])
+            return
+
+        matched = result["matched"]
+        for slot, path in matched.items():
+            target_vars[slot].set(path)
+
+        lines = [f"✅ {what} 自動比對成功 {len(matched)} / {len(SLOT_NUMBERS)} 個 Slot："]
+        for slot in sorted(matched):
+            lines.append(f"   Slot {slot} -> {matched[slot]}")
+        if result["missing_slots"]:
+            lines += ["", "⚠️ 這些 Slot 沒有找到對應的資料，請手動填寫："
+                      + ", ".join(f"Slot {s}" for s in result["missing_slots"])]
+        if result["ambiguous"]:
+            lines += ["", "⚠️ 以下 Slot 編號同時對應到多個子資料夾，已使用第一個找到的，其餘被忽略："]
+            lines += [f"   Slot {s}：{n}" for s, n in result["ambiguous"]]
+        if result["unmatched_folders"]:
+            lines += ["", "ℹ️ 以下子資料夾名稱看不出 Slot 編號，已略過："]
+            lines += [f"   {n}" for n in result["unmatched_folders"]]
+
+        if clear:
+            self._clear_log()
+        for line in lines:
+            self._append_log(line)
+
+    def _auto_fill_from_parents(self):
+        """上層資料夾欄位有貼路徑、但對應的 Slot 欄位還是空的，就自動比對一次
+        (避免忘記按「自動比對」)。"""
+        for name, parent_var, matcher, target in (
+            ("SDR log", self.sdr_parent_var, auto_match_slot_folders, self.sdr_vars),
+            ("NVQual", self.nvq_parent_var, auto_match_nvqual, self.nvq_vars),
+        ):
+            if clean_path(parent_var.get()) and not any(v.get().strip() for v in target.values()):
+                self._apply_match(name, parent_var.get(), matcher, target, clear=False)
+
+    def clear_slots(self):
+        for var in list(self.sdr_vars.values()) + list(self.nvq_vars.values()):
+            var.set("")
+
+    def _append_log(self, text):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", text + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def on_run_clicked(self):
+        template_path = self.template_path_var.get().strip()
+        if not template_path:
+            messagebox.showerror("錯誤", "請先選擇 Excel 模板！")
+            return
+        if not os.path.isfile(template_path):
+            messagebox.showerror("錯誤", f"找不到模板檔案：\n{template_path}")
+            return
+
+        self._clear_log()
+        self._auto_fill_from_parents()
+        slot_sdr = {s: v.get() for s, v in self.sdr_vars.items()}
+        slot_nvq = {s: v.get() for s, v in self.nvq_vars.items()}
+        if not any(p.strip() for p in list(slot_sdr.values()) + list(slot_nvq.values())):
+            messagebox.showwarning(
+                "提醒", "還沒有任何 Slot 的路徑。\n請在上方貼上 SDR log / NVQual 的上層資料夾路徑 "
+                        "(可直接按開始，程式會自動比對)，或針對各 Slot 自行選擇檔案/資料夾。")
+            return
+
+        default_name = f"SDR_Thermal_PWR_Margin_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        output_path = filedialog.asksaveasfilename(
+            title="選擇輸出 Excel 的儲存位置",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel 檔案", "*.xlsx")],
+        )
+        if not output_path:
+            return  # 使用者取消
+
+        self._append_log("\n開始處理，請稍候 (第一次讀 NVQual 壓縮檔需要一點時間)...")
+        self.run_button.configure(state="disabled")
+        self.status_label.configure(text="處理中...")
+
+        threading.Thread(
+            target=self._process_in_background,
+            args=(template_path, slot_sdr, slot_nvq, output_path),
+            daemon=True,
+        ).start()
+        self._poll_queue()
+
+    def _process_in_background(self, template_path, slot_sdr, slot_nvq, output_path):
+        q = self._queue
+        try:
+            with open(template_path, "rb") as f:
+                template_bytes = f.read()
+            result = process_excel(
+                template_bytes, slot_sdr, slot_nvq, output_path,
+                progress=lambda msg: q.put(("progress", msg)),
+            )
+            q.put(("done", result + (None,)))
+        except Exception as e:
+            q.put(("done", (None, [], {}, (e, traceback.format_exc()))))
+
+    def _poll_queue(self):
+        """主執行緒定時取出背景執行緒的訊息：更新進度，或在完成時顯示結果。"""
+        try:
+            while True:
+                kind, payload = self._queue.get_nowait()
+                if kind == "progress":
+                    self.status_label.configure(text=payload)
+                else:
+                    self._on_process_done(*payload)
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _on_process_done(self, result_path, status_messages, preview_data, error):
+        self.run_button.configure(state="normal")
+        self.status_label.configure(text="")
+
+        if error is not None:
+            e, err_text = error
+            self._append_log(f"❌ 處理失敗：{e}")
+            self._append_log(err_text)
+            messagebox.showerror("處理失敗", f"發生錯誤：\n{e}")
+            return
+
+        if status_messages:
+            self._append_log(f"⚠️ 共 {len(status_messages)} 則提醒：")
+            for msg in status_messages:
+                self._append_log(" - " + msg)
+        elif preview_data and any(preview_data.values()):
+            self._append_log("✅ 全部項目都有讀到數值，沒有異常訊息。")
+
+        filled_slots = sorted({sl for d in preview_data.values() for sl in d},
+                              key=lambda s: int(s.split()[1]))
+        self._append_log(f"\n已填寫資料的 Slot：{', '.join(filled_slots) if filled_slots else '（無）'}")
+        self._append_log(f"\n✅ 完成！已儲存至：\n{result_path}")
+
+        if messagebox.askyesno("完成", f"Excel 已產生完成：\n{result_path}\n\n要開啟所在資料夾嗎？"):
+            self._open_containing_folder(result_path)
+
+    def _open_containing_folder(self, path):
+        folder = os.path.dirname(os.path.abspath(path))
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                os.system(f'open "{folder}"')
+            else:
+                os.system(f'xdg-open "{folder}"')
+        except Exception as e:
+            messagebox.showwarning("提醒", f"無法自動開啟資料夾，請手動前往：\n{folder}\n\n({e})")
+
+
+if __name__ == "__main__":
+    app = SdrApp()
+    app.mainloop()
