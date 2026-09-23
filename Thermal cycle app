@@ -1,1 +1,320 @@
+import gradio as gr
+import pandas as pd
+import numpy as np
+import plotly.express as px
 
+def analyze_excel(file, target_low, low_min, low_max, target_high, high_min, high_max, dwell_time, sample_interval_min, show_all_data):
+    if file is None:
+        return None, None, None, None, "請先上傳 Excel 檔案！ / Please upload an Excel file!"
+    
+    try:
+        t_low = float(target_low) if target_low is not None else None
+        l_min = float(low_min) if low_min is not None else None
+        l_max = float(low_max) if low_max is not None else None
+        
+        t_high = float(target_high) if target_high is not None else None
+        h_min = float(high_min) if high_min is not None else None
+        h_max = float(high_max) if high_max is not None else None
+        
+        dwell_t = float(dwell_time) if dwell_time is not None else 30.0
+        s_interval = float(sample_interval_min) if sample_interval_min is not None else 1.0
+
+        # 1. 讀取 Excel 全量數據 (開放讀取至數萬筆)
+        df_raw = pd.read_excel(file.name, header=None, engine='openpyxl')
+        
+        # 2. 自動尋找包含 'Date' 與 'Time' 的標題列
+        header_idx = None
+        for idx, row in df_raw.iterrows():
+            row_str = [str(val).strip() for val in row.values]
+            if any('Date' in s for s in row_str) and any('Time' in s for s in row_str):
+                header_idx = idx
+                break
+        
+        if header_idx is None:
+            return None, None, None, None, "❌ 找不到 'Date' 或 'Time' 欄位，請確認 Excel 格式！"
+
+        # 3. 擷取資料與處理通道
+        data = df_raw.iloc[header_idx + 1:].copy().reset_index(drop=True)
+        
+        channel_names = []
+        ch_row_idx = header_idx - 2
+        if ch_row_idx >= 0:
+            ch_row = df_raw.iloc[ch_row_idx].values
+            for i in range(3, len(ch_row)):
+                val = str(ch_row[i]).strip()
+                if val and val.lower() not in ['nan', 'none', '']:
+                    channel_names.append(val)
+
+        num_data_cols = data.shape[1] - 3
+        if len(channel_names) != num_data_cols:
+            channel_names = [f'CH{i:03d}' for i in range(1, num_data_cols + 1)]
+
+        data.columns = ['Date', 'Time', 'Sec'] + channel_names[:num_data_cols]
+        ch_cols = channel_names[:num_data_cols]
+
+        # 4. 轉換日期與數據格式
+        data['DateTime'] = pd.to_datetime(data['Date'].astype(str) + ' ' + data['Time'].astype(str), errors='coerce')
+        for col in ch_cols:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+
+        total_rows = len(data)
+
+        # 5. Plotly 折線圖
+        chart_title = f"📈 溫度變化趨勢圖 Temperature Trend ({ch_cols[0]} - {ch_cols[-1]}) [總筆數：{total_rows} 筆]"
+        fig = px.line(
+            data, 
+            x='DateTime', 
+            y=ch_cols, 
+            title=chart_title,
+            labels={"value": "溫度 Temp (°C)", "DateTime": "時間 Time", "variable": "通道 Channel"}
+        )
+        fig.update_layout(
+            template="plotly_dark", 
+            paper_bgcolor="#0d1117",
+            plot_bgcolor="#161b22",
+            hovermode="x unified",
+            title=dict(font=dict(size=22, color="#ffffff")),
+            xaxis_title="時間 Time",
+            yaxis_title="溫度 Temp (°C)",
+            hoverlabel=dict(font_size=14, namelength=-1, bgcolor="#1f2937", font_color="#38bdf8")
+        )
+        fig.update_traces(hovertemplate="%{y:.1f}°C<extra>%{fullData.name}</extra>")
+        
+        # 6. 選擇顯示「全量資料」或「極限過濾資料」
+        if show_all_data:
+            filtered_result = data.copy()
+        else:
+            filtered_df = data.copy()
+            conditions = pd.Series(False, index=filtered_df.index)
+            
+            if l_min is not None and l_max is not None:
+                conditions |= ((filtered_df[ch_cols] >= l_min) & (filtered_df[ch_cols] <= l_max)).any(axis=1)
+            if h_min is not None and h_max is not None:
+                conditions |= ((filtered_df[ch_cols] >= h_min) & (filtered_df[ch_cols] <= h_max)).any(axis=1)
+            if h_max is not None:
+                conditions |= (filtered_df[ch_cols] > h_max).any(axis=1)
+            if l_min is not None:
+                conditions |= (filtered_df[ch_cols] < l_min).any(axis=1)
+                
+            filtered_result = filtered_df[conditions].copy()
+        
+        def apply_cell_styles(val):
+            styles = ['background-color: #0d1117 !important; color: #e2e8f0 !important; border: 1px solid #ffffff !important;']
+            if not isinstance(val, (int, float)) or pd.isna(val):
+                return ' '.join(styles)
+            
+            if (h_max is not None and val > h_max) or (l_min is not None and val < l_min):
+                styles.append('background-color: #ff4d4f !important; color: #000000 !important; font-weight: bold;')
+            elif l_min is not None and l_max is not None and (l_min <= val <= l_max):
+                styles.append('background-color: #bae6fd !important; color: #0369a1 !important; font-weight: bold;') 
+            elif h_min is not None and h_max is not None and (h_min <= val <= h_max):
+                styles.append('background-color: #fbcfe8 !important; color: #831843 !important; font-weight: bold;') 
+            
+            return ' '.join(styles)
+
+        if not filtered_result.empty:
+            filtered_result['DateTime'] = filtered_result['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            filtered_result[ch_cols] = filtered_result[ch_cols].round(1)
+            display_cols = ['DateTime'] + ch_cols
+            filtered_result_display = filtered_result[display_cols].copy()
+            styled_filtered_df = filtered_result_display.style.map(apply_cell_styles, subset=display_cols)
+        else:
+            empty_df = pd.DataFrame(columns=['DateTime'] + ch_cols)
+            styled_filtered_df = empty_df.style.map(apply_cell_styles)
+
+        # 7. 15 Cycles 全量資料時間統計
+        avg_temp = data[ch_cols].mean(axis=1)
+        mid_point = (l_max + h_min) / 2 if (l_max is not None and h_min is not None) else avg_temp.mean()
+        
+        is_low = avg_temp <= mid_point
+        cycle_groups = (is_low != is_low.shift()).cumsum()
+        
+        low_eq_col = f"Minimum {t_low}°C thermal equilibrium(±3°C) minutes"
+        low_reach_col = f"Maximum time to reach {t_low}°C thermal equilibrium(±3°C)"
+        high_eq_col = f"Minimum +{t_high}°C thermal equilibrium(±3°C) minutes"
+        high_reach_col = f"Maximum time to reach +{t_high}°C thermal equilibrium(±3°C)"
+
+        cycle_summary_list = []
+        cycle_data = {i: {low_eq_col: None, low_reach_col: None, high_eq_col: None, high_reach_col: None} for i in range(1, 16)}
+        
+        low_cnt = 0
+        high_cnt = 0
+
+        for g_id, group in data.groupby(cycle_groups):
+            if group.empty:
+                continue
+            
+            group_mean_t = group[ch_cols].mean().mean()
+            
+            if group_mean_t <= mid_point and low_cnt < 15:
+                low_cnt += 1
+                min_valid_mins = 999
+                for ch in ch_cols:
+                    temps = group[ch].dropna()
+                    valid_pts = ((temps >= l_min) & (temps <= l_max)).sum() if (l_min and l_max) else 0
+                    v_mins = int(round(valid_pts * s_interval))
+                    if v_mins < min_valid_mins:
+                        min_valid_mins = v_mins
+                
+                if min_valid_mins > 0 and min_valid_mins != 999:
+                    max_reach_mins = int(round(max(0, dwell_t - min_valid_mins)))
+                else:
+                    min_valid_mins = 0
+                    max_reach_mins = None
+
+                cycle_data[low_cnt][low_eq_col] = min_valid_mins
+                cycle_data[low_cnt][low_reach_col] = max_reach_mins
+                
+            elif group_mean_t > mid_point and high_cnt < 15:
+                high_cnt += 1
+                min_valid_mins = 999
+                for ch in ch_cols:
+                    temps = group[ch].dropna()
+                    valid_pts = ((temps >= h_min) & (temps <= h_max)).sum() if (h_min and h_max) else 0
+                    v_mins = int(round(valid_pts * s_interval))
+                    if v_mins < min_valid_mins:
+                        min_valid_mins = v_mins
+                
+                if min_valid_mins > 0 and min_valid_mins != 999:
+                    max_reach_mins = int(round(max(0, dwell_t - min_valid_mins)))
+                else:
+                    min_valid_mins = 0
+                    max_reach_mins = None
+
+                cycle_data[high_cnt][high_eq_col] = min_valid_mins
+                cycle_data[high_cnt][high_reach_col] = max_reach_mins
+
+        for c_num in range(1, 16):
+            c_info = cycle_data[c_num]
+            cycle_summary_list.append({
+                "Cycle No.": c_num,
+                low_eq_col: c_info[low_eq_col],
+                low_reach_col: c_info[low_reach_col],
+                high_eq_col: c_info[high_eq_col],
+                high_reach_col: c_info[high_reach_col]
+            })
+
+        cycle_summary_df = pd.DataFrame(cycle_summary_list)
+
+        valid_low_reach = cycle_summary_df[low_reach_col].dropna()
+        max_low_reach = valid_low_reach.max() if not valid_low_reach.empty else None
+
+        valid_high_reach = cycle_summary_df[high_reach_col].dropna()
+        max_high_reach = valid_high_reach.max() if not valid_high_reach.empty else None
+
+        def highlight_cyber_style(col):
+            col_name = col.name
+            styles = []
+            for v in col:
+                base_style = 'background-color: #0d1117 !important; color: #38bdf8 !important; border: 1px solid #ffffff !important;'
+                if (col_name == low_reach_col and pd.notna(v) and pd.notna(max_low_reach) and v == max_low_reach) or \
+                   (col_name == high_reach_col and pd.notna(v) and pd.notna(max_high_reach) and v == max_high_reach):
+                    styles.append('background-color: #facc15 !important; font-weight: 900 !important; color: #000000 !important; border: 1px solid #ffffff !important;')
+                else:
+                    styles.append(base_style)
+            return styles
+
+        styled_cycle_df = cycle_summary_df.style.apply(highlight_cyber_style)
+
+        # 8. 匯出 CSV
+        csv_cycles = "cycle_equilibrium_summary.csv"
+        cycle_summary_df.to_csv(csv_cycles, index=False, encoding='utf-8-sig')
+
+        msg = f"⚡ 成功讀取全量共 {total_rows} 筆數據！分析已順利完成。"
+        
+        return fig, styled_filtered_df, styled_cycle_df, csv_cycles, msg
+    
+    except Exception as e:
+        return None, None, None, None, f"❌ 錯誤 Error: {e}"
+
+# --- CSS 全局設定 ---
+cyber_css = """
+body, .gradio-container, .main {
+    background-color: #090d16 !important;
+    font-size: 1.5rem !important;
+    color: #e2e8f0 !important;
+}
+
+h1 { font-size: 2.2rem !important; color: #38bdf8 !important; text-shadow: 0 0 10px #0284c7; }
+h3 { font-size: 1.7rem !important; color: #22d3ee !important; border-left: 4px solid #38bdf8; padding-left: 10px; }
+
+.block, .panel, .form {
+    background-color: #0d1117 !important;
+    border: 1px solid #ffffff !important;
+    border-radius: 8px !important;
+}
+
+input, textarea, select {
+    font-size: 1.4rem !important;
+    background-color: #161b22 !important;
+    color: #38bdf8 !important;
+    border: 1px solid #ffffff !important;
+    border-radius: 6px !important;
+}
+
+label, span.label, .label-wrap, [data-testid="block-label"], .block-label, label span {
+    color: #ffffff !important;
+    font-size: 1.5rem !important;
+    font-weight: bold !important;
+    background-color: transparent !important;
+}
+
+button.primary-btn {
+    background-color: #0284c7 !important;
+    border: 1px solid #38bdf8 !important;
+    color: #ffffff !important;
+    font-size: 1.5rem !important;
+    font-weight: bold !important;
+    padding: 10px 20px !important;
+}
+"""
+
+with gr.Blocks(title="Thermal Cycle 熱循環數據分析工具", css=cyber_css, theme=gr.themes.Base()) as demo:
+    gr.Markdown("# 🌡️ Thermal Cycle 熱循環數據分析工具 / Thermal Cycle Data Analysis Tool")
+    
+    with gr.Row():
+        file_input = gr.File(label="📁 上傳 Excel 檔案 / Upload Excel File (.xlsx)", file_types=[".xlsx", ".xls"])
+    
+    gr.Markdown("### ⚙️ 溫度條件與預覽設定 / Temperature & View Settings")
+    with gr.Row():
+        target_low_input = gr.Number(label="低溫設定目標 / Low Target (°C)", value=-40)
+        low_min_input = gr.Number(label="低溫下限值 / Low Min Bound (°C)", value=-47)
+        low_max_input = gr.Number(label="低溫上限值 / Low Max Bound (°C)", value=-37)
+        
+    with gr.Row():
+        target_high_input = gr.Number(label="高溫設定目標 / High Target (°C)", value=100)
+        high_min_input = gr.Number(label="高溫下限值 / High Min Bound (°C)", value=97)
+        high_max_input = gr.Number(label="高溫上限值 / High Max Bound (°C)", value=103)
+    
+    with gr.Row():
+        dwell_time_input = gr.Number(label="持溫時間 / Dwell Time (min)", value=30)
+        sample_interval_input = gr.Number(label="採樣間隔 / Sample Interval (min)", value=1.0)
+        show_all_checkbox = gr.Checkbox(label="📄 下方數據表顯示全量原始數據 (顯示 23,000+ 或 50,000+ 全部行)", value=False)
+    
+    btn_run = gr.Button("🚀 開始分析 / Run Analysis", elem_classes=["primary-btn"])
+    
+    status_output = gr.Textbox(label="⚡ 執行狀態 / Execution Status", interactive=False)
+    
+    plot_output = gr.Plot(show_label=False)
+    
+    gr.Markdown("### 🔍 數據預覽資料表 / Temperature Data Table")
+    table_output = gr.Dataframe(label="數據明細 / Data Details", interactive=False)
+
+    gr.Markdown("### ⏱️ Thermal Equilibrium 分析報表 (15 Cycles 最差極限值統計)")
+    cycle_table_output = gr.Dataframe(label="15 Cycles 時間計算結果", interactive=False)
+    cycle_file_output = gr.File(label="💾 下載 Cycle 平衡時間統計 CSV 報表")
+
+    inputs = [
+        file_input, 
+        target_low_input, low_min_input, low_max_input,
+        target_high_input, high_min_input, high_max_input,
+        dwell_time_input, sample_interval_input,
+        show_all_checkbox
+    ]
+    outputs = [plot_output, table_output, cycle_table_output, cycle_file_output, status_output]
+
+    file_input.upload(fn=analyze_excel, inputs=inputs, outputs=outputs)
+    btn_run.click(fn=analyze_excel, inputs=inputs, outputs=outputs)
+
+if __name__ == "__main__":
+    demo.launch(inbrowser=True)
