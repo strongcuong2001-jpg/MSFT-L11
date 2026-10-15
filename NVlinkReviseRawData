@@ -1,1 +1,147 @@
+"""
+NVLink raw data reviser.
 
+1. Slot*.txt: keep only the data from the LAST ssh login session: everything up
+   to and including the KP-Server prompt line right after the previous
+   "Connection to ... closed." is removed, and the run of empty prompt lines
+   above the ssh command is shortened to the last 3.
+2. Screenshot*.png: crop off the Ubuntu top bar and left dock, keeping only the
+   terminal window (starting at its title bar).
+
+Source files are left untouched; results are written to the output folder.
+
+Usage:
+    py -3 NVlinkReviseRawData.py "<source folder>" "<output folder>"
+    (or run without arguments and paste both paths when asked)
+"""
+import re
+import shutil
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+LAST_LOGIN_RE = re.compile(rb"Last login:")
+CLOSED_RE = re.compile(rb"Connection to \S+ closed\.")
+SSH_CMD_RE = re.compile(rb"#\s*ssh\s+\S+@")
+EMPTY_PROMPT_RE = re.compile(rb"^[^\s@]+@[^\s:]+:\S*[#$]\s*$")
+
+# Empty prompt lines kept right above the ssh command line.
+KEEP_EMPTY_PROMPTS = 3
+
+# Ubuntu 1920x1080 layout: top bar 32px, dock 66px. Used if auto-detect fails.
+DEFAULT_TOP, DEFAULT_LEFT = 32, 66
+
+
+def find_cut_index(lines):
+    """Return the index of the first line to keep, or None if nothing to trim."""
+    last_login = max((i for i, l in enumerate(lines) if LAST_LOGIN_RE.search(l)), default=None)
+    if last_login is None:
+        return None
+
+    # Preferred rule: the last "Connection to ... closed." before the last login;
+    # delete it and the prompt line right after it.
+    closed = max((i for i in range(last_login) if CLOSED_RE.search(lines[i])), default=None)
+    if closed is not None:
+        return min(closed + 2, last_login)
+
+    # Fallback: no previous session closed in this file -> keep from the last ssh command line.
+    ssh = max((i for i in range(last_login) if SSH_CMD_RE.search(lines[i])), default=None)
+    if ssh is not None and ssh > 0:
+        return ssh
+    return None
+
+
+def shorten_leading_prompts(lines, cut):
+    """Skip extra empty prompt lines between the cut and the ssh command line."""
+    end = cut
+    while end < len(lines) and EMPTY_PROMPT_RE.match(lines[end]):
+        end += 1
+    if end < len(lines) and SSH_CMD_RE.search(lines[end]):
+        return max(cut, end - KEEP_EMPTY_PROMPTS)
+    return cut
+
+
+def process_file(path, out_dir):
+    out_path = out_dir / path.name
+    lines = path.read_bytes().splitlines(keepends=True)
+    cut = shorten_leading_prompts(lines, find_cut_index(lines) or 0)
+    if not cut:
+        shutil.copy2(path, out_path)
+        print(f"[COPY] {path.name}: no earlier session to remove, copied as-is")
+        return
+
+    out_path.write_bytes(b"".join(lines[cut:]))
+    first = lines[cut].decode("utf-8", "replace").strip()
+    print(f"[OK]   {path.name}: removed {cut} lines, {len(lines) - cut} kept (starts at: {first!r})")
+
+
+def is_light(px):
+    return all(c >= 220 for c in px[:3])
+
+
+def find_window_origin(im):
+    """Locate the top-left corner of the light-gray terminal title bar."""
+    w, h = im.size
+    probe_x = w * 2 // 3  # right of the clock, left of the tray icons
+    top = next((y for y in range(h // 4) if is_light(im.getpixel((probe_x, y)))), None)
+    if top is None:
+        return None
+    row_y = top + 3
+    run = 50  # need a long light run so dock icons don't count
+    left = next((x for x in range(w // 4)
+                 if all(is_light(im.getpixel((x + k, row_y))) for k in range(run))), None)
+    if left is None:
+        return None
+    return top, left
+
+
+def process_image(path, out_dir):
+    out_path = out_dir / path.name
+    with Image.open(path) as im:
+        rgb = im.convert("RGB")
+        origin = find_window_origin(rgb)
+        if origin is None:
+            top, left = DEFAULT_TOP, DEFAULT_LEFT
+            note = "auto-detect failed, used default"
+        else:
+            top, left = origin
+            note = "auto-detected"
+        if top == 0:  # title bar already at the top -> no Ubuntu top bar to remove
+            shutil.copy2(path, out_path)
+            print(f"[COPY] {path.name}: already cropped, copied as-is")
+            return
+        im.crop((left, top, im.width, im.height)).save(out_path)
+    print(f"[OK]   {path.name}: cropped top {top}px, left {left}px ({note}) -> {im.width - left}x{im.height - top}")
+
+
+def ask_path(argv_index, prompt):
+    raw = sys.argv[argv_index] if len(sys.argv) > argv_index else input(prompt)
+    return Path(raw.strip().strip('"'))
+
+
+def main():
+    src = ask_path(1, "Source folder: ")
+    if not src.is_dir():
+        sys.exit(f"Source folder not found: {src}")
+    out = ask_path(2, "Output folder: ")
+    if out.resolve() == src.resolve():
+        sys.exit("Output folder must be different from source folder (originals are kept untouched).")
+    out.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(src.glob("Slot*.txt"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+    images = sorted(src.glob("Screenshot*.png"))
+    if not files and not images:
+        sys.exit(f"No Slot*.txt or Screenshot*.png files in {src}")
+
+    print(f"--- Logs ({len(files)}) ---")
+    for f in files:
+        process_file(f, out)
+    print(f"--- Screenshots ({len(images)}) ---")
+    for f in images:
+        process_image(f, out)
+    print(f"\nDone. {len(files)} log(s) + {len(images)} screenshot(s) written to: {out}")
+
+
+if __name__ == "__main__":
+    main()
