@@ -1,7 +1,7 @@
 """
 NVLink raw data reviser.
 
-1. Slot*.txt: keep only the data from the LAST ssh login session: everything up
+1. *Slot*.txt: keep only the ssh session whose "Last login:" date is newest: everything up
    to and including the KP-Server prompt line right after the previous
    "Connection to ... closed." is removed, and the run of empty prompt lines
    above the ssh command is shortened to the last 3.
@@ -17,11 +17,14 @@ Usage:
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
 
 LAST_LOGIN_RE = re.compile(rb"Last login:")
+# e.g. "Last login: Tue Sep 15 04:24:07 UTC 2026 from ..."
+LOGIN_DATE_RE = re.compile(rb"Last login:\s+(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d) \S+ (\d{4})")
 CLOSED_RE = re.compile(rb"Connection to \S+ closed\.")
 SSH_CMD_RE = re.compile(rb"#\s*ssh\s+\S+@")
 EMPTY_PROMPT_RE = re.compile(rb"^[^\s@]+@[^\s:]+:\S*[#$]\s*$")
@@ -33,20 +36,44 @@ KEEP_EMPTY_PROMPTS = 3
 DEFAULT_TOP, DEFAULT_LEFT = 32, 66
 
 
+def parse_login_date(line):
+    m = LOGIN_DATE_RE.search(line)
+    if not m:
+        return None
+    try:
+        text = f"{m.group(1).decode()} {m.group(2).decode()}"
+        return datetime.strptime(text, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+
+
+def find_newest_login(lines):
+    """Index of the "Last login:" line with the newest date (later line wins ties)."""
+    logins = [(i, parse_login_date(l)) for i, l in enumerate(lines) if LAST_LOGIN_RE.search(l)]
+    if not logins:
+        return None
+    dated = [(d, i) for i, d in logins if d is not None]
+    if dated:
+        return max(dated)[1]
+    return logins[-1][0]
+
+
 def find_cut_index(lines):
     """Return the index of the first line to keep, or None if nothing to trim."""
-    last_login = max((i for i, l in enumerate(lines) if LAST_LOGIN_RE.search(l)), default=None)
+    last_login = find_newest_login(lines)
     if last_login is None:
         return None
 
+    # The ssh command that started this session is always kept.
+    ssh = max((i for i in range(last_login) if SSH_CMD_RE.search(lines[i])), default=None)
+
     # Preferred rule: the last "Connection to ... closed." before the last login;
-    # delete it and the prompt line right after it.
+    # delete it and the prompt line right after it (but never past the ssh command).
     closed = max((i for i in range(last_login) if CLOSED_RE.search(lines[i])), default=None)
     if closed is not None:
-        return min(closed + 2, last_login)
+        return min(closed + 2, ssh if ssh is not None and ssh > closed else last_login)
 
     # Fallback: no previous session closed in this file -> keep from the last ssh command line.
-    ssh = max((i for i in range(last_login) if SSH_CMD_RE.search(lines[i])), default=None)
     if ssh is not None and ssh > 0:
         return ssh
     return None
@@ -129,10 +156,10 @@ def main():
         sys.exit("Output folder must be different from source folder (originals are kept untouched).")
     out.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(src.glob("Slot*.txt"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+    files = sorted(src.glob("*Slot*.txt"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
     images = sorted(src.glob("Screenshot*.png"))
     if not files and not images:
-        sys.exit(f"No Slot*.txt or Screenshot*.png files in {src}")
+        sys.exit(f"No *Slot*.txt or Screenshot*.png files in {src}")
 
     print(f"--- Logs ({len(files)}) ---")
     for f in files:
